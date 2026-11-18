@@ -473,8 +473,9 @@ def _draw(state: dict) -> None:
     operator = '×' if mode == _MUL else '÷'
     main = f'{entry}   {operator} 10^{shift}   =   {preview_text(negative, digits, shift, mode)}'
     title = state['label']
-    hint = (f"{state['finer_name']} / {state['coarser_name']}: exponent   "
-            f"{state['mode_name']}: ÷ ×   Space: apply   Esc: cancel")
+    # Coarser key first, finer key second: left to right matches the direction of the bar.
+    hint = (f"{state['coarser_name']} / {state['finer_name']}: exponent   "
+            f"{state['mode_name']}: ÷ ×   Space: apply   RMB: cancel")
     has_switch = not state['is_int']  # integer fields are always multiply
 
     # Layout: measure every row first so the card fits its widest text.
@@ -819,8 +820,8 @@ def _draw_slide(state: dict) -> None:
     title = state['label']
     main = state['value_text']
     step_line = f"step   {operator} 10^{state['eff_shift']}   =   {step_text}"
-    hint = (f"{state['finer_name']} / {state['coarser_name']}: step   "
-            f"{state['mode_name']}: ÷ ×   Shift: finer   Esc: cancel")
+    hint = (f"{state['coarser_name']} / {state['finer_name']}: step   "
+            f"{state['mode_name']}: ÷ ×   Shift: finer   RMB: cancel")
 
     pad = 10 * scale
     blf.size(0, base)
