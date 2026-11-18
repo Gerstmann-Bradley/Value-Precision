@@ -1,5 +1,5 @@
 # Value-Precision
-A Blender add-on that allows you to input or modify values more precisely.
+A Blender add-on that allows you to input or modify values more precisely. Made with Claude.
 
 # Type Values
 1. Hover your mouse to the socket and hit shortcut, by default as "`" (the Backtick key under the Esc and on the left of "1")
