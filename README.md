@@ -3,6 +3,8 @@ A Blender add-on that allows you to input or modify values more precisely. Made 
 
 It works everywhere in Blender. For simplicity, most demonstrations use Geometry Nodes as an example.
 
+Currently You need to install it as an "Add-on". It will be made into Extension Later
+
 # Type Values
 1. Hover your mouse to the socket and hit shortcut, by default as "`"
 
