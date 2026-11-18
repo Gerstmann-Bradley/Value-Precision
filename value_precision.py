@@ -82,8 +82,8 @@ class VP_Preferences(AddonPreferences):
         description='A confirming mouse click is also passed on, so it can start the next field right away',
         default=True)
     # Stored as event-type identifiers so they survive restarts; set through VP_OT_capture_key.
-    finer_key: StringProperty(name='Finer Key', description='Increase the exponent (more decimals)', default='X')
     coarser_key: StringProperty(name='Coarser Key', description='Decrease the exponent (fewer decimals)', default='Z')
+    finer_key: StringProperty(name='Finer Key', description='Increase the exponent (more decimals)', default='X')
     mode_key: StringProperty(name='Mode Key', description='Switch between divide and multiply', default='C')
 
     slide_enabled: BoolProperty(
@@ -132,8 +132,8 @@ class VP_Preferences(AddonPreferences):
 
         box = layout.box()
         box.label(text='Keys inside the popup and while sliding (click, then press a key)')
-        for attr, label in (('finer_key', 'Finer (bigger exponent)'),
-                            ('coarser_key', 'Coarser (smaller exponent)'),
+        for attr, label in (('coarser_key', 'Coarser (smaller exponent)'),
+                            ('finer_key', 'Finer (bigger exponent)'),
                             ('mode_key', 'Switch ÷ / ×')):
             row = box.row(align=True)
             row.label(text=label)
