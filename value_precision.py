@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Value Precision",
     "author": "",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (4, 2, 0),
     "location": "Hover a number field: press ` to type, hold middle mouse to slide",
-    "description": "Enter digits at a defined precision (e.g. 5 with ÷10³ = 0.005), or use the Middle Mouse Button to adjust values in clean 10ⁿ steps by scrolling.",
+    "description": "Type digits (5 with ÷10^3 = 0.005) or slide values in clean 10^n steps",
     "category": "Interface",
 }
 
@@ -39,7 +39,8 @@ _RESERVED_KEYS = frozenset(_DIGITS) | {'MINUS', 'NUMPAD_MINUS', 'BACK_SPACE', 'S
 _FINER_EXTRA = frozenset({'UP_ARROW', 'WHEELUPMOUSE'})
 _COARSER_EXTRA = frozenset({'DOWN_ARROW', 'WHEELDOWNMOUSE'})
 
-_MAX_SHIFT = 9      # highest power of ten offered by the bar
+_MAX_SHIFT = 9      # highest power of ten (used by sliding, which has no bar)
+_TYPE_MAX_SHIFT = 5  # highest exponent on the typing popup's bar
 _MAX_DIGITS = 12    # cap on typed digits
 _DIV, _MUL = 'DIV', 'MUL'
 _KEYMAPS = []       # (keymap, item) pairs added at register time, removed on unregister
@@ -85,6 +86,11 @@ class VP_Preferences(AddonPreferences):
     coarser_key: StringProperty(name='Coarser Key', description='Decrease the exponent (fewer decimals)', default='Z')
     finer_key: StringProperty(name='Finer Key', description='Increase the exponent (more decimals)', default='X')
     mode_key: StringProperty(name='Mode Key', description='Switch between divide and multiply', default='C')
+    sign_key: StringProperty(name='Sign Key', description='Switch between positive and negative', default='V')
+    auto_sign: BoolProperty(
+        name='Detect Sign',
+        description='Start typing with the sign of the current value, so a negative field gives a negative result',
+        default=True)
 
     slide_enabled: BoolProperty(
         name='Middle Mouse Sliding',
@@ -118,6 +124,7 @@ class VP_Preferences(AddonPreferences):
         layout.prop(self, 'offset')
         layout.prop(self, 'whole_shift')
         layout.prop(self, 'remember_last')
+        layout.prop(self, 'auto_sign')
         layout.prop(self, 'click_passthrough')
 
         slide = layout.box()
@@ -134,7 +141,8 @@ class VP_Preferences(AddonPreferences):
         box.label(text='Keys inside the popup and while sliding (click, then press a key)')
         for attr, label in (('coarser_key', 'Coarser (smaller exponent)'),
                             ('finer_key', 'Finer (bigger exponent)'),
-                            ('mode_key', 'Switch ÷ / ×')):
+                            ('mode_key', 'Switch ÷ / ×'),
+                            ('sign_key', 'Switch + / −')):
             row = box.row(align=True)
             row.label(text=label)
             op = row.operator(VP_OT_capture_key.bl_idname, text=key_name(getattr(self, attr)))
@@ -193,7 +201,8 @@ class VP_OT_capture_key(Operator):
             return {'CANCELLED'}
         prefs = _prefs(context)
         if prefs is not None:
-            others = {prefs.finer_key, prefs.coarser_key, prefs.mode_key} - {getattr(prefs, self.target)}
+            others = ({prefs.coarser_key, prefs.finer_key, prefs.mode_key, prefs.sign_key}
+                      - {getattr(prefs, self.target)})
             if event.type in others:
                 self.report({'WARNING'}, f'{key_name(event.type)} is already used by another action')
                 return {'CANCELLED'}
@@ -210,7 +219,8 @@ def count_decimals(value: float) -> int:
     return len(text.partition('.')[2])
 
 
-def initial_shift(display_value: float, is_int: bool, offset: int, whole_shift: int) -> int:
+def initial_shift(display_value: float, is_int: bool, offset: int, whole_shift: int,
+                  limit: int = _MAX_SHIFT) -> int:
     """Auto-detected starting exponent (for ÷) of a field currently showing ``display_value``.
 
     Fields with decimals: decimals + offset. Fields without (0, 1, 10 ...): ``whole_shift``.
@@ -220,7 +230,7 @@ def initial_shift(display_value: float, is_int: bool, offset: int, whole_shift: 
         return 0
     decimals = count_decimals(display_value)
     shift = decimals + offset if decimals else whole_shift
-    return max(0, min(_MAX_SHIFT, shift))
+    return max(0, min(limit, shift))
 
 
 def _scaled(negative: bool, digits: str, shift: int, mode: str) -> Decimal:
@@ -474,21 +484,26 @@ def _draw(state: dict) -> None:
     main = f'{entry}   {operator} 10^{shift}   =   {preview_text(negative, digits, shift, mode)}'
     title = state['label']
     # Coarser key first, finer key second: left to right matches the direction of the bar.
-    hint = (f"{state['coarser_name']} / {state['finer_name']}: exponent   "
-            f"{state['mode_name']}: ÷ ×   Space: apply   RMB: cancel")
-    has_switch = not state['is_int']  # integer fields are always multiply
+    hint_keys = (f"{state['coarser_name']} / {state['finer_name']}: exponent   "
+                 f"{state['mode_name']}: ÷ ×   {state['sign_name']}: + −")
+    hint_actions = 'Space: apply   RMB: cancel'
+    has_mode = not state['is_int']  # integer fields are always multiply
 
     # Layout: measure every row first so the card fits its widest text.
     pad = 10 * scale
+    gap = pad * .5
     blf.size(0, base)
     title_w = blf.dimensions(0, title)[0]
     blf.size(0, big)
     main_w = blf.dimensions(0, main)[0]
     blf.size(0, small)
-    hint_w = blf.dimensions(0, hint)[0]
-    cells = _MAX_SHIFT + 1 + (2 if has_switch else 0)  # bar cells plus two for the ÷ / × switch
-    width = max(title_w, main_w, hint_w, base * 1.9 * cells) + pad * 2
-    heights = (small * 1.7, base * 2.0, big * 1.7, base * 1.6)  # bottom -> top
+    hint_w = max(blf.dimensions(0, hint_keys)[0], blf.dimensions(0, hint_actions)[0])
+    # Controls row: [÷ ×] [+ −] [0 .. 5]; the mode switch is absent for integer fields.
+    groups = ([2] if has_mode else []) + [2, _TYPE_MAX_SHIFT + 1]
+    cells = sum(groups)
+    controls_w = base * 1.9 * cells + gap * (len(groups) - 1)
+    width = max(title_w, main_w, hint_w, controls_w) + pad * 2
+    heights = (small * 1.5, small * 1.5, base * 2.0, big * 1.7, base * 1.6)  # bottom -> top
     height = sum(heights) + pad
     # Sit just above-right of the cursor, clamped inside the region.
     left = min(max(state['mouse'][0] + 12 * scale, 2), max(2, region.width - width - 2))
@@ -502,45 +517,52 @@ def _draw(state: dict) -> None:
     _fill(left + inset, bottom + inset, width - inset * 2, height - inset * 2, inner, max(0.0, radius - inset))
     state['card'] = (left, bottom, width, height)
 
-    # Rows are laid out from the bottom up: hint, controls, main line, field name.
+    # Rows are laid out from the bottom up: two hint rows, controls, main line, field name.
+    dim = _mix(text_c, inner, .35)
     y = bottom + pad * .5
-    _text(hint, small, (left, y, width, heights[0]), _mix(text_c, inner, .35), pad=pad)
+    _text(hint_actions, small, (left, y, width, heights[0]), dim, pad=pad)
     y += heights[0]
+    _text(hint_keys, small, (left, y, width, heights[1]), dim, pad=pad)
+    y += heights[1]
 
-    # Controls row: [÷][×] switch on the left (floats only), then the 0..9 exponent bar.
-    row_bottom, row_height = y + base * .15, heights[1] - base * .3
-    gap = pad * .5 if has_switch else 0.0
-    cell = (width - pad * 2 - gap) / cells
-    track_left = left + pad
+    row_bottom, row_height = y + base * .15, heights[2] - base * .3
+    cell = (width - pad * 2 - gap * (len(groups) - 1)) / cells
     track_bg = _mix(inner, _rgba(menu.outline), .35)
-    state['mode_rects'] = None
-    if has_switch:
-        div_rect = (track_left, row_bottom, cell, row_height)
-        mul_rect = (track_left + cell, row_bottom, cell, row_height)
-        state['mode_rects'] = (div_rect, mul_rect)
-        _fill(track_left, row_bottom, cell * 2, row_height, track_bg, radius * .6)
-        for rect, symbol, key in ((div_rect, '÷', _DIV), (mul_rect, '×', _MUL)):
-            active = mode == key
-            if active:
+
+    def draw_switch(x, symbols, active):
+        """A two-cell switch; returns its two cell rectangles for hit-testing."""
+        rects = tuple((x + cell * i, row_bottom, cell, row_height) for i in range(2))
+        _fill(x, row_bottom, cell * 2, row_height, track_bg, radius * .6)
+        for i, (rect, symbol) in enumerate(zip(rects, symbols)):
+            if i == active:
                 _fill(*rect, selected, radius * .6)
-            _text(symbol, base, rect, text_sel if active else text_c, 'CENTER')
+            _text(symbol, base, rect, text_sel if i == active else text_c, 'CENTER')
+        return rects
+
+    track_left = left + pad
+    state['mode_rects'] = None
+    if has_mode:
+        state['mode_rects'] = draw_switch(track_left, ('÷', '×'), 1 if mode == _MUL else 0)
         track_left += cell * 2 + gap
-    bar = (track_left, row_bottom, cell * (_MAX_SHIFT + 1), row_height)
+    state['sign_rects'] = draw_switch(track_left, ('+', '−'), 1 if negative else 0)
+    track_left += cell * 2 + gap
+
+    bar = (track_left, row_bottom, cell * (_TYPE_MAX_SHIFT + 1), row_height)
     state['slider'] = bar
     _fill(*bar, track_bg, radius * .6)
-    for i in range(_MAX_SHIFT + 1):
+    for i in range(_TYPE_MAX_SHIFT + 1):
         rect = (bar[0] + cell * i, row_bottom, cell, row_height)
         if i == shift:
             _fill(*rect, selected, radius * .6)                 # current exponent
         elif i < shift:
             _fill(*rect, _mix(inner, selected, .35))            # tint everything below it
         _text(str(i), base, rect, text_sel if i == shift else text_c, 'CENTER')
-    y += heights[1]
-
-    _fill(left + inset * 2, y, width - inset * 4, heights[2], selected, radius * .8)
-    _text(main, big, (left, y, width, heights[2]), text_sel, pad=pad)
     y += heights[2]
-    _text(title, base, (left, y, width, heights[3]), text_c, pad=pad)
+
+    _fill(left + inset * 2, y, width - inset * 4, heights[3], selected, radius * .8)
+    _text(main, big, (left, y, width, heights[3]), text_sel, pad=pad)
+    y += heights[3]
+    _text(title, base, (left, y, width, heights[4]), text_c, pad=pad)
     gpu.state.blend_set('NONE')
 
 
@@ -571,12 +593,16 @@ class VP_OT_entry(Operator):
         remember = prefs.remember_last if prefs else True
         self._passthrough = prefs.click_passthrough if prefs else True
         self._trigger = event.type  # pressing the same key again confirms (unless it has another job)
-        finer = prefs.finer_key if prefs else 'X'
         coarser = prefs.coarser_key if prefs else 'Z'
+        finer = prefs.finer_key if prefs else 'X'
         mode_key = prefs.mode_key if prefs else 'C'
         self._finer = frozenset({finer}) | _FINER_EXTRA
         self._coarser = frozenset({coarser}) | _COARSER_EXTRA
         self._mode_key = mode_key
+        sign_key = prefs.sign_key if prefs else 'V'
+        self._sign_key = sign_key
+        # The result takes the sign of the current value (zero counts as positive).
+        negative = bool(prefs.auto_sign if prefs else True) and display < 0
 
         # Starting mode and exponent. Integers start in multiply mode (dividing them is
         # pointless); floats with decimals are auto-detected; whole-number floats may reuse the
@@ -584,9 +610,10 @@ class VP_OT_entry(Operator):
         if self._target.is_int:
             mode, shift = _MUL, 0
         else:
-            mode, shift = _DIV, initial_shift(display, False, offset, whole)
+            mode, shift = _DIV, initial_shift(display, False, offset, whole, _TYPE_MAX_SHIFT)
             if not count_decimals(display) and remember and _last_choice is not None:
                 mode, shift = _last_choice
+                shift = min(shift, _TYPE_MAX_SHIFT)
 
         # Everything the draw callback and modal need lives in a plain dict, so the draw
         # handler never holds a reference to the operator instance.
@@ -598,15 +625,17 @@ class VP_OT_entry(Operator):
             'mode': mode,
             'is_int': self._target.is_int,
             'digits': '',
-            'negative': False,
+            'negative': negative,
+            'sign_rects': None,    # ((+ rect), (− rect)), set by _draw
             'manual': False,       # True once the user changed mode or exponent by hand
             'dragging': False,     # True while the mouse is scrubbing the bar
             'slider': None,        # (left, bottom, width, height) of the bar, set by _draw
             'mode_rects': None,    # ((÷ rect), (× rect)), set by _draw
             'card': None,          # rectangle of the whole popup
-            'finer_name': key_name(finer),
             'coarser_name': key_name(coarser),
+            'finer_name': key_name(finer),
             'mode_name': key_name(mode_key),
+            'sign_name': key_name(sign_key),
         }
         self._space = type(context.space_data)
         self._region_type = context.region.type
@@ -638,7 +667,7 @@ class VP_OT_entry(Operator):
     def _cell(state, x) -> int:
         """Exponent under region x coordinate ``x`` on the bar (clamped to 0..9)."""
         left, _bottom, width, _height = state['slider']
-        return max(0, min(_MAX_SHIFT, int((x - left) / (width / (_MAX_SHIFT + 1)))))
+        return max(0, min(_TYPE_MAX_SHIFT, int((x - left) / (width / (_TYPE_MAX_SHIFT + 1)))))
 
     def _set_shift(self, context, value: int) -> None:
         """Change the exponent by hand and remember that it was a manual override."""
@@ -702,6 +731,12 @@ class VP_OT_entry(Operator):
                     if self._inside(rect, x, y):
                         self._set_mode(context, mode)
                         return {'RUNNING_MODAL'}
+            if state['sign_rects']:
+                for rect, negative in zip(state['sign_rects'], (False, True)):
+                    if self._inside(rect, x, y):
+                        state['negative'] = negative
+                        context.region.tag_redraw()
+                        return {'RUNNING_MODAL'}
             if state['slider'] and self._inside(state['slider'], x, y):
                 state['dragging'] = True
                 self._set_shift(context, self._cell(state, x))
@@ -720,7 +755,8 @@ class VP_OT_entry(Operator):
 
         # 5. Confirm. The trigger key confirms too, except when it is also assigned to the
         #    exponent or mode (e.g. trigger = Z with Z as "coarser"): then that job wins.
-        busy = kind in self._finer or kind in self._coarser or kind == self._mode_key
+        busy = (kind in self._coarser or kind in self._finer
+                or kind in {self._mode_key, self._sign_key})
         if kind in {'SPACE', 'RET', 'NUMPAD_ENTER'} or (kind == self._trigger and not busy
                                                         and not event.is_repeat):
             return self._confirm(context)
@@ -734,17 +770,14 @@ class VP_OT_entry(Operator):
         if kind in _DIGITS:
             if len(state['digits']) < _MAX_DIGITS:
                 state['digits'] += _DIGITS[kind]
-        elif kind in {'MINUS', 'NUMPAD_MINUS'}:
+        elif kind in {'MINUS', 'NUMPAD_MINUS'} or kind == self._sign_key:
             state['negative'] = not state['negative']
         elif kind == 'BACK_SPACE':
-            if state['digits']:
-                state['digits'] = state['digits'][:-1]
-            else:
-                state['negative'] = False  # nothing left to delete: clear the sign instead
-        elif kind in self._finer:
-            self._set_shift(context, min(_MAX_SHIFT, state['shift'] + 1))
+            state['digits'] = state['digits'][:-1]
         elif kind in self._coarser:
             self._set_shift(context, max(0, state['shift'] - 1))
+        elif kind in self._finer:
+            self._set_shift(context, min(_TYPE_MAX_SHIFT, state['shift'] + 1))
         elif kind == self._mode_key:
             self._set_mode(context, _DIV if state['mode'] == _MUL else _MUL)
         else:
@@ -889,11 +922,11 @@ class VP_OT_slide(Operator):
         offset = prefs.slide_offset if prefs else 0
         whole = prefs.slide_whole_shift if prefs else 0
         remember = prefs.slide_remember_last if prefs else True
-        finer = prefs.finer_key if prefs else 'X'
         coarser = prefs.coarser_key if prefs else 'Z'
+        finer = prefs.finer_key if prefs else 'X'
         mode_key = prefs.mode_key if prefs else 'C'
-        self._finer = frozenset({finer}) | _FINER_EXTRA
         self._coarser = frozenset({coarser}) | _COARSER_EXTRA
+        self._finer = frozenset({finer}) | _FINER_EXTRA
         self._mode_key = mode_key
         pixels = prefs.pixels_per_step if prefs else 12.0
         self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
@@ -924,8 +957,8 @@ class VP_OT_slide(Operator):
             'is_int': self._target.is_int,
             'manual': False,
             'value_text': '',
-            'finer_name': key_name(finer),
             'coarser_name': key_name(coarser),
+            'finer_name': key_name(finer),
             'mode_name': key_name(mode_key),
         }
         self._refresh_text()
@@ -1065,10 +1098,10 @@ class VP_OT_slide(Operator):
                 if self._target.raw() != self._expected:
                     self._target.write_raw(self._expected)
             elif event.value == 'PRESS':
-                if kind in self._finer:
-                    self._set_step(context, event, shift=min(_MAX_SHIFT, state['shift'] + 1))
-                elif kind in self._coarser:
+                if kind in self._coarser:
                     self._set_step(context, event, shift=max(0, state['shift'] - 1))
+                elif kind in self._finer:
+                    self._set_step(context, event, shift=min(_MAX_SHIFT, state['shift'] + 1))
                 elif kind == self._mode_key and not state['is_int']:
                     self._set_step(context, event, mode=_DIV if state['mode'] == _MUL else _MUL)
         except _SLIDE_ERRORS:
