@@ -77,7 +77,7 @@ class VP_Preferences(AddonPreferences):
         name='Remember Last Choice for Whole Numbers',
         description='When a field has no decimals (for example 0), start from the mode (÷ or ×) and exponent '
                     'you last chose by hand instead of the fixed whole-number exponent',
-        default=True)
+        default=False)
     click_passthrough: BoolProperty(
         name='Click Also Acts Normally',
         description='A confirming mouse click is also passed on, so it can start the next field right away',
@@ -113,7 +113,7 @@ class VP_Preferences(AddonPreferences):
     slide_remember_last: BoolProperty(
         name='Remember Last Slide Step for Whole Numbers',
         description='When a field has no decimals, start sliding with the mode and exponent you last chose by hand',
-        default=True)
+        default=False)
     pixels_per_step: FloatProperty(
         name='Pixels per Step',
         description='Horizontal drag distance, in UI pixels, for one step',
