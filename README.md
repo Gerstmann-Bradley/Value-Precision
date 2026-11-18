@@ -1,6 +1,8 @@
 # Value-Precision
 A Blender add-on that allows you to input or modify values more precisely. Made with Claude.
 
+It works everywhere in Blender. For simplicity, most demonstrations use Geometry Nodes as an example.
+
 # Type Values
 1. Hover your mouse to the socket and hit shortcut, by default as "`"
 
