@@ -1,0 +1,1117 @@
+bl_info = {
+    "name": "Value Precision",
+    "author": "",
+    "version": (0, 4, 0),
+    "blender": (4, 2, 0),
+    "location": "Hover a number field: press ` to type, hold middle mouse to slide",
+    "description": "Type digits (5 with ÷10^3 = 0.005) or slide values in clean 10^n steps",
+    "category": "Interface",
+}
+
+import math
+import re
+from decimal import Decimal
+from typing import Optional, Tuple
+
+import blf
+import bpy
+import gpu
+from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
+from bpy.types import AddonPreferences, Operator
+from gpu_extras.batch import batch_for_shader
+
+# --------------------------------------------------------------------------- constants
+
+# Splits a data path such as  modifiers["GeometryNodes"]["Socket_2"]  into the pointer part
+# (everything before the last subscript) and the custom-property name. Geometry Nodes group
+# inputs and user-defined properties are exposed this way rather than as RNA attributes.
+_CUSTOM = re.compile(r'^(?P<ptr>.*?)\.?\["(?P<name>(?:[^"\\]|\\.)*)"\]$')
+
+# Event types that type a digit (top row and numpad).
+_DIGITS = {name: str(i) for i, name in enumerate(
+    ('ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE'))}
+_DIGITS.update({f'NUMPAD_{i}': str(i) for i in range(10)})
+
+# Keys with a fixed meaning inside the popup; they cannot be assigned to configurable actions.
+_RESERVED_KEYS = frozenset(_DIGITS) | {'MINUS', 'NUMPAD_MINUS', 'BACK_SPACE', 'SPACE', 'RET',
+                                       'NUMPAD_ENTER', 'ESC'}
+# Extra, always-on shift inputs in addition to the two configurable keys.
+_FINER_EXTRA = frozenset({'UP_ARROW', 'WHEELUPMOUSE'})
+_COARSER_EXTRA = frozenset({'DOWN_ARROW', 'WHEELDOWNMOUSE'})
+
+_MAX_SHIFT = 9      # highest power of ten offered by the bar
+_MAX_DIGITS = 12    # cap on typed digits
+_DIV, _MUL = 'DIV', 'MUL'
+_KEYMAPS = []       # (keymap, item) pairs added at register time, removed on unregister
+_shader = None      # cached builtin shader; released in unregister()
+# Last (mode, shift) chosen by hand this session; reused for whole-number fields (remember_last).
+_last_choice: Optional[Tuple[str, int]] = None
+_last_slide_choice: Optional[Tuple[str, int]] = None  # same, for sliding
+_sliding = False    # True while a slide is in progress (prevents a second one starting)
+
+
+def key_name(identifier: str) -> str:
+    """Human-readable name for an event type identifier ('ONE' -> '1')."""
+    item = bpy.types.Event.bl_rna.properties['type'].enum_items.get(identifier)
+    return item.name if item else identifier
+
+
+# --------------------------------------------------------------------------- preferences
+
+class VP_Preferences(AddonPreferences):
+    """Addon preferences: auto-detection behaviour and the configurable keys."""
+
+    bl_idname = __name__
+
+    offset: IntProperty(
+        name='Auto-detect Offset',
+        description='Added to the number of decimals found in the current value. '
+                    '0 keeps the same precision (0.05 -> 10^2), 1 goes one step finer (0.05 -> 10^3)',
+        default=0, min=-3, max=6)
+    whole_shift: IntProperty(
+        name='Exponent for Whole Numbers',
+        description='Starting ÷ 10^n when the current value has no decimals (0, 1, 10, 100 ...)',
+        default=0, min=0, max=_MAX_SHIFT)
+    remember_last: BoolProperty(
+        name='Remember Last Choice for Whole Numbers',
+        description='When a field has no decimals (for example 0), start from the mode (÷ or ×) and exponent '
+                    'you last chose by hand instead of the fixed whole-number exponent',
+        default=True)
+    click_passthrough: BoolProperty(
+        name='Click Also Acts Normally',
+        description='A confirming mouse click is also passed on, so it can start the next field right away',
+        default=True)
+    # Stored as event-type identifiers so they survive restarts; set through VP_OT_capture_key.
+    finer_key: StringProperty(name='Finer Key', description='Increase the exponent (more decimals)', default='X')
+    coarser_key: StringProperty(name='Coarser Key', description='Decrease the exponent (fewer decimals)', default='Z')
+    mode_key: StringProperty(name='Mode Key', description='Switch between divide and multiply', default='C')
+
+    slide_enabled: BoolProperty(
+        name='Middle Mouse Sliding',
+        description='Hold the middle mouse button over a number field and drag to change it in clean steps',
+        default=True)
+    slide_offset: IntProperty(
+        name='Slide Auto-detect Offset',
+        description='Added to the number of decimals found in the current value to pick the slide step. '
+                    '0 keeps the same precision (0.05 slides by 0.01). Anything above 0 adds a decimal '
+                    'every time you slide again; hold Shift while sliding for a finer step instead',
+        default=0, min=-3, max=6)
+    slide_fine_offset: IntProperty(
+        name='Extra Decimals While Holding Shift',
+        description='How many decimals finer the slide step gets while Shift is held',
+        default=1, min=1, max=4)
+    slide_whole_shift: IntProperty(
+        name='Slide Exponent for Whole Numbers',
+        description='Starting step 10^-n when the current value has no decimals (0, 1, 10, 100 ...)',
+        default=0, min=0, max=_MAX_SHIFT)
+    slide_remember_last: BoolProperty(
+        name='Remember Last Slide Step for Whole Numbers',
+        description='When a field has no decimals, start sliding with the mode and exponent you last chose by hand',
+        default=True)
+    pixels_per_step: FloatProperty(
+        name='Pixels per Step',
+        description='Horizontal drag distance, in UI pixels, for one step',
+        default=12.0, min=1.0, soft_max=100.0)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, 'offset')
+        layout.prop(self, 'whole_shift')
+        layout.prop(self, 'remember_last')
+        layout.prop(self, 'click_passthrough')
+
+        slide = layout.box()
+        slide.label(text='Sliding (hold middle mouse over a field and drag)')
+        slide.prop(self, 'slide_enabled')
+        slide.prop(self, 'slide_offset')
+        slide.prop(self, 'slide_fine_offset')
+        slide.prop(self, 'slide_whole_shift')
+        slide.prop(self, 'slide_remember_last')
+        slide.prop(self, 'pixels_per_step')
+        slide.label(text='Middle mouse is bound in the "View2D", "View2D Buttons List" and "Window" keymaps.')
+
+        box = layout.box()
+        box.label(text='Keys inside the popup and while sliding (click, then press a key)')
+        for attr, label in (('finer_key', 'Finer (bigger exponent)'),
+                            ('coarser_key', 'Coarser (smaller exponent)'),
+                            ('mode_key', 'Switch ÷ / ×')):
+            row = box.row(align=True)
+            row.label(text=label)
+            op = row.operator(VP_OT_capture_key.bl_idname, text=key_name(getattr(self, attr)))
+            op.target = attr
+        box.label(text='Mouse wheel and Up / Down arrows also change the exponent; the bar and switch work with the mouse.')
+
+        layout.label(text='Typing: digits, Minus, Backspace.  Confirm: Space, Enter, trigger key again, or a click outside the popup.')
+        layout.label(text='Cancel: Esc or right click.')
+        try:
+            # Show the trigger key binding with Blender's own keymap widget.
+            import rna_keymap_ui
+            keyconfig = context.window_manager.keyconfigs.user
+            keymap = keyconfig.keymaps.get('User Interface')
+            item = next(k for k in keymap.keymap_items if k.idname == VP_OT_entry.bl_idname)
+            rna_keymap_ui.draw_kmi([], keyconfig, keymap, item, layout, 0)
+        except (AttributeError, StopIteration, ImportError):
+            pass  # keymap not available (e.g. background mode); the rest of the panel still works
+
+
+def _prefs(context) -> Optional[VP_Preferences]:
+    """The addon's preferences, or None when it is not registered as an addon."""
+    try:
+        return context.preferences.addons[__name__].preferences
+    except KeyError:
+        return None
+
+
+class VP_OT_capture_key(Operator):
+    """Preferences helper: wait for the next key press and store it for one popup action."""
+
+    bl_idname = 'value_precision.capture_key'
+    bl_label = 'Set Key'
+    bl_description = 'Click, then press the key to use'
+    bl_options = {'INTERNAL'}
+
+    target: StringProperty(options={'HIDDEN'})  # name of the preference to set
+
+    def invoke(self, context, _event):
+        context.window_manager.modal_handler_add(self)
+        context.workspace.status_text_set('Press a key (Esc to cancel)')
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        # Let the window keep redrawing and tracking the mouse while we wait.
+        if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'TIMER', 'TIMER_REPORT'}:
+            return {'PASS_THROUGH'}
+        if event.value != 'PRESS':
+            return {'RUNNING_MODAL'}
+        context.workspace.status_text_set(None)
+        if event.type == 'ESC':
+            return {'CANCELLED'}
+        if event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE'} or event.type.startswith(('WHEEL', 'EVT_TWEAK')):
+            return {'CANCELLED'}  # mouse buttons are not valid keys here
+        if event.type in _RESERVED_KEYS:
+            self.report({'WARNING'}, f'{key_name(event.type)} is used for typing or confirming')
+            return {'CANCELLED'}
+        prefs = _prefs(context)
+        if prefs is not None:
+            others = {prefs.finer_key, prefs.coarser_key, prefs.mode_key} - {getattr(prefs, self.target)}
+            if event.type in others:
+                self.report({'WARNING'}, f'{key_name(event.type)} is already used by another action')
+                return {'CANCELLED'}
+            setattr(prefs, self.target, event.type)
+        context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+# --------------------------------------------------------------------------- value helpers
+
+def count_decimals(value: float) -> int:
+    """Number of visible decimals, ignoring float noise (0.05000000074 -> 2)."""
+    text = f'{abs(value):.6f}'.rstrip('0')
+    return len(text.partition('.')[2])
+
+
+def initial_shift(display_value: float, is_int: bool, offset: int, whole_shift: int) -> int:
+    """Auto-detected starting exponent (for ÷) of a field currently showing ``display_value``.
+
+    Fields with decimals: decimals + offset. Fields without (0, 1, 10 ...): ``whole_shift``.
+    Integer fields always use 0 (they start in multiply mode, see ``invoke``).
+    """
+    if is_int:
+        return 0
+    decimals = count_decimals(display_value)
+    shift = decimals + offset if decimals else whole_shift
+    return max(0, min(_MAX_SHIFT, shift))
+
+
+def _scaled(negative: bool, digits: str, shift: int, mode: str) -> Decimal:
+    """Typed digits scaled by 10**shift, as an exact Decimal (no float rounding noise)."""
+    exponent = shift if mode == _MUL else -shift
+    return Decimal(f"{'-' if negative else ''}{digits}e{exponent}")
+
+
+def shifted_value(negative: bool, digits: str, shift: int, mode: str = _DIV) -> Optional[float]:
+    """Typed digits ÷ or × 10**shift as a float, or None when nothing was typed.
+
+    Going through Decimal means 5 with ÷10^3 is exactly 0.005, not 0.005000000000000001.
+    """
+    if not digits:
+        return None
+    return float(_scaled(negative, digits, shift, mode))
+
+
+def preview_text(negative: bool, digits: str, shift: int, mode: str) -> str:
+    """Exact plain-notation result for display ('0.005', '500000'), or an em dash if empty."""
+    if not digits:
+        return '—'
+    return format(_scaled(negative, digits, shift, mode), 'f')
+
+
+class Target:
+    """The hovered numeric property: resolved once at invoke, written once at confirm.
+
+    Handles regular RNA properties and ID custom properties (Geometry Nodes inputs), scalars
+    and single vector components, ints and floats. Raises ``ValueError`` for anything else so
+    the caller can simply pass the key press through.
+    """
+
+    def __init__(self, context, prop_tuple):
+        # context.property is (owner, data_path, index); validate it before trusting it.
+        if not isinstance(prop_tuple, tuple) or len(prop_tuple) != 3:
+            raise ValueError('Not a numeric field')
+        owner, path, index = prop_tuple
+        if not isinstance(owner, bpy.types.bpy_struct) or not isinstance(path, str) or not path:
+            raise ValueError('Not a numeric field')
+
+        # Split the path into "struct that owns the value" + "property name".
+        match = _CUSTOM.match(path)
+        if match:
+            ptr_path, self.name, self.custom = match['ptr'], bpy.utils.unescape_identifier(match['name']), True
+        else:
+            ptr_path, _, self.name = path.rpartition('.')
+            self.custom = False
+            if '[' in self.name:
+                raise ValueError('Unsupported property path')
+        self.pointer = owner.path_resolve(ptr_path) if ptr_path else owner
+        if not isinstance(self.pointer, bpy.types.bpy_struct):
+            raise ValueError('Not a numeric field')
+        self.rotation = False  # True when the field is shown in degrees but stored in radians
+
+        if self.custom:
+            value = self.pointer[self.name]
+            self.array = hasattr(value, 'typecode')  # IDPropertyArray exposes a typecode
+            sample = value[max(0, index)] if self.array else value
+            if isinstance(sample, bool) or not isinstance(sample, (int, float)):
+                raise ValueError('Not a numeric field')
+            self.is_int = isinstance(sample, int)
+            prop = None
+        else:
+            prop = self.pointer.bl_rna.properties.get(self.name)
+            if prop is None or prop.type not in {'FLOAT', 'INT'}:
+                raise ValueError('Not a numeric field')
+            if prop.is_readonly:
+                raise ValueError('The field is read-only')
+            self.array = prop.is_array
+            self.is_int = prop.type == 'INT'
+            self.rotation = (prop.type == 'FLOAT' and prop.unit == 'ROTATION'
+                             and context.scene.unit_settings.system_rotation == 'DEGREES')
+        if self.array and index < 0:
+            raise ValueError('Hover a single component')  # whole-vector widgets (colour swatches ...)
+        self.index = max(0, index)
+        self.label = self._label(prop)
+
+    def _label(self, prop) -> str:
+        """A name worth showing: the socket / input name rather than 'default_value'.
+
+        * Geometry Nodes modifier inputs are stored as 'Socket_2'; look the real name up in the
+          node group's interface.
+        * Node sockets expose their value as 'default_value'; use the socket's own name, with
+          the node's label for context.
+        * Anything else uses the property's UI name.
+        """
+        pointer = self.pointer
+        try:
+            if self.custom:
+                if isinstance(pointer, bpy.types.NodesModifier) and pointer.node_group:
+                    for item in pointer.node_group.interface.items_tree:
+                        if item.item_type == 'SOCKET' and item.identifier == self.name:
+                            return item.name
+                return self.name
+            name = prop.name
+            owner_name = getattr(pointer, 'name', None)
+            if (self.name == 'default_value' or not name) and isinstance(owner_name, str) and owner_name:
+                node = getattr(pointer, 'node', None)
+                node_name = (node.label or node.name) if node is not None else ''
+                return f'{node_name}: {owner_name}' if node_name else owner_name
+            return name or self.name.replace('_', ' ').title()
+        except (AttributeError, ReferenceError, RuntimeError):
+            return self.name.replace('_', ' ').title()
+
+    def raw(self) -> float:
+        """Stored value (radians for rotations)."""
+        value = self.pointer[self.name] if self.custom else getattr(self.pointer, self.name)
+        return value[self.index] if self.array else value
+
+    def display(self) -> float:
+        """Value as the user sees it (degrees for rotations); used for auto-detection."""
+        value = self.raw()
+        return math.degrees(value) if self.rotation else value
+
+    def write(self, display_value: float) -> None:
+        """Store a value given in display units (degrees for rotations)."""
+        value = math.radians(display_value) if self.rotation else display_value
+        if self.is_int:
+            value = int(round(value))
+        if self.array:
+            values = self.pointer[self.name] if self.custom else getattr(self.pointer, self.name)
+            values[self.index] = value
+        elif self.custom:
+            self.pointer[self.name] = value
+        else:
+            setattr(self.pointer, self.name, value)
+        owner = self.pointer.id_data
+        if owner is not None:
+            owner.update_tag()  # make sure the owning ID is flagged for undo and depsgraph
+
+    def write_raw(self, raw_value: float) -> None:
+        """Store an exact stored value (no unit conversion); used to restore or re-apply."""
+        if self.array:
+            values = self.pointer[self.name] if self.custom else getattr(self.pointer, self.name)
+            values[self.index] = raw_value
+        elif self.custom:
+            self.pointer[self.name] = raw_value
+        else:
+            setattr(self.pointer, self.name, raw_value)
+        owner = self.pointer.id_data
+        if owner is not None:
+            owner.update_tag()
+
+    def autokey(self, context) -> None:
+        """Mirror native behaviour: with Auto Keying on, only update channels already animated.
+
+        Driven channels are skipped. Any failure is ignored on purpose: the value is already
+        written and auto-keying is a convenience.
+        """
+        try:
+            owner = self.pointer.id_data
+            animation = getattr(owner, 'animation_data', None)
+            if (not context.scene.tool_settings.use_keyframe_insert_auto
+                    or animation is None or animation.action is None):
+                return
+            path = self.pointer.path_from_id('["' + bpy.utils.escape_identifier(self.name) + '"]'
+                                             if self.custom else self.name)
+            index = self.index if self.array else -1
+            animated = any(f.data_path == path and (index < 0 or f.array_index == index)
+                           for f in animation.action.fcurves)
+            if animated and not any(d.data_path == path for d in animation.drivers):
+                owner.keyframe_insert(path, index=index)
+        except (AttributeError, RuntimeError, TypeError, ValueError, ReferenceError):
+            pass
+
+
+# --------------------------------------------------------------------------- drawing
+
+def _rgba(value) -> tuple:
+    """Theme colours may be RGB or RGBA; always return RGBA."""
+    color = tuple(float(c) for c in value)
+    return color if len(color) == 4 else (*color[:3], 1.0)
+
+
+def _mix(first: tuple, second: tuple, amount: float) -> tuple:
+    """Linear blend from ``first`` to ``second`` (0 = first, 1 = second)."""
+    return tuple(p + (q - p) * amount for p, q in zip(first, second))
+
+
+def _path(left, bottom, width, height, radius) -> list:
+    """Vertices of a (rounded) rectangle, ordered for a triangle fan."""
+    radius = min(max(0.0, radius), width * .5, height * .5)
+    if radius < .5:
+        return [(left, bottom), (left + width, bottom), (left + width, bottom + height), (left, bottom + height)]
+    steps = max(5, min(12, math.ceil(radius)))  # corner segments; enough for UI sizes
+    points = []
+    # Four corners: (centre x, centre y, start angle), counter-clockwise from bottom-left.
+    for cx, cy, start in ((left + radius, bottom + radius, math.pi),
+                          (left + width - radius, bottom + radius, math.pi * 1.5),
+                          (left + width - radius, bottom + height - radius, 0.0),
+                          (left + radius, bottom + height - radius, math.pi * .5)):
+        for i in range(steps + 1):
+            angle = start + math.pi * .5 * i / steps
+            points.append((cx + math.cos(angle) * radius, cy + math.sin(angle) * radius))
+    return points
+
+
+def _fill(left, bottom, width, height, color, radius=0.0) -> None:
+    """Draw a filled, optionally rounded rectangle in region pixel coordinates."""
+    global _shader
+    if width <= 0 or height <= 0 or color[3] <= 0:
+        return
+    if _shader is None:
+        _shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    _shader.bind()
+    _shader.uniform_float('color', color)
+    batch_for_shader(_shader, 'TRI_FAN', {'pos': _path(left, bottom, width, height, radius)}).draw(_shader)
+
+
+def _text(text, size, rect, color, align='LEFT', pad=0.0) -> None:
+    """Draw ``text`` vertically centred in ``rect``; align is 'LEFT' or 'CENTER'."""
+    left, bottom, width, height = rect
+    blf.size(0, size)
+    text_w = blf.dimensions(0, text)[0]
+    x = left + pad if align == 'LEFT' else left + (width - text_w) * .5
+    # Centre on a fixed reference height so digits and letters sit on the same baseline.
+    blf.position(0, x, bottom + (height - blf.dimensions(0, 'Ag')[1]) * .5, 0)
+    blf.color(0, *color)
+    blf.draw(0, text)
+
+
+def _draw(state: dict) -> None:
+    """POST_PIXEL draw callback for the popup.
+
+    ``state`` is the operator's plain dict (not the operator itself, which may be freed while
+    the handler is still registered). The card, bar and mode-switch rectangles computed here are
+    stored back into ``state`` so the modal handler can hit-test mouse clicks against them.
+    """
+    context = bpy.context
+    region = context.region
+    # The handler is registered for a region *type* on every space of that class; only draw
+    # in the one region the popup belongs to.
+    if region is None or region.as_pointer() != state['region']:
+        return
+
+    # Theme colours and sizes are read every frame so theme and scale changes apply live.
+    prefs = context.preferences
+    ui = prefs.themes[0].user_interface
+    menu, item = ui.wcol_menu_back, ui.wcol_menu_item
+    scale = max(.25, float(prefs.system.ui_scale))
+    base = float(prefs.ui_styles[0].widget.points) * scale
+    big, small = base * 1.5, base * .85
+    text_c, text_sel = _rgba(item.text), _rgba(item.text_sel)
+    selected, inner = _rgba(item.inner_sel), _rgba(menu.inner)
+
+    # Texts.
+    shift, digits, negative, mode = state['shift'], state['digits'], state['negative'], state['mode']
+    entry = ('-' if negative else '') + (digits or '_')
+    operator = '×' if mode == _MUL else '÷'
+    main = f'{entry}   {operator} 10^{shift}   =   {preview_text(negative, digits, shift, mode)}'
+    title = state['label']
+    hint = (f"{state['finer_name']} / {state['coarser_name']}: exponent   "
+            f"{state['mode_name']}: ÷ ×   Space: apply   Esc: cancel")
+    has_switch = not state['is_int']  # integer fields are always multiply
+
+    # Layout: measure every row first so the card fits its widest text.
+    pad = 10 * scale
+    blf.size(0, base)
+    title_w = blf.dimensions(0, title)[0]
+    blf.size(0, big)
+    main_w = blf.dimensions(0, main)[0]
+    blf.size(0, small)
+    hint_w = blf.dimensions(0, hint)[0]
+    cells = _MAX_SHIFT + 1 + (2 if has_switch else 0)  # bar cells plus two for the ÷ / × switch
+    width = max(title_w, main_w, hint_w, base * 1.9 * cells) + pad * 2
+    heights = (small * 1.7, base * 2.0, big * 1.7, base * 1.6)  # bottom -> top
+    height = sum(heights) + pad
+    # Sit just above-right of the cursor, clamped inside the region.
+    left = min(max(state['mouse'][0] + 12 * scale, 2), max(2, region.width - width - 2))
+    bottom = min(max(state['mouse'][1] + 12 * scale, 2), max(2, region.height - height - 2))
+    radius = base * 1.6 * min(1.0, max(0.0, float(menu.roundness))) * .5
+
+    gpu.state.blend_set('ALPHA')
+    # Card: outline colour underneath, background inset on top.
+    _fill(left, bottom, width, height, _rgba(menu.outline), radius)
+    inset = max(1.0, scale)
+    _fill(left + inset, bottom + inset, width - inset * 2, height - inset * 2, inner, max(0.0, radius - inset))
+    state['card'] = (left, bottom, width, height)
+
+    # Rows are laid out from the bottom up: hint, controls, main line, field name.
+    y = bottom + pad * .5
+    _text(hint, small, (left, y, width, heights[0]), _mix(text_c, inner, .35), pad=pad)
+    y += heights[0]
+
+    # Controls row: [÷][×] switch on the left (floats only), then the 0..9 exponent bar.
+    row_bottom, row_height = y + base * .15, heights[1] - base * .3
+    gap = pad * .5 if has_switch else 0.0
+    cell = (width - pad * 2 - gap) / cells
+    track_left = left + pad
+    track_bg = _mix(inner, _rgba(menu.outline), .35)
+    state['mode_rects'] = None
+    if has_switch:
+        div_rect = (track_left, row_bottom, cell, row_height)
+        mul_rect = (track_left + cell, row_bottom, cell, row_height)
+        state['mode_rects'] = (div_rect, mul_rect)
+        _fill(track_left, row_bottom, cell * 2, row_height, track_bg, radius * .6)
+        for rect, symbol, key in ((div_rect, '÷', _DIV), (mul_rect, '×', _MUL)):
+            active = mode == key
+            if active:
+                _fill(*rect, selected, radius * .6)
+            _text(symbol, base, rect, text_sel if active else text_c, 'CENTER')
+        track_left += cell * 2 + gap
+    bar = (track_left, row_bottom, cell * (_MAX_SHIFT + 1), row_height)
+    state['slider'] = bar
+    _fill(*bar, track_bg, radius * .6)
+    for i in range(_MAX_SHIFT + 1):
+        rect = (bar[0] + cell * i, row_bottom, cell, row_height)
+        if i == shift:
+            _fill(*rect, selected, radius * .6)                 # current exponent
+        elif i < shift:
+            _fill(*rect, _mix(inner, selected, .35))            # tint everything below it
+        _text(str(i), base, rect, text_sel if i == shift else text_c, 'CENTER')
+    y += heights[1]
+
+    _fill(left + inset * 2, y, width - inset * 4, heights[2], selected, radius * .8)
+    _text(main, big, (left, y, width, heights[2]), text_sel, pad=pad)
+    y += heights[2]
+    _text(title, base, (left, y, width, heights[3]), text_c, pad=pad)
+    gpu.state.blend_set('NONE')
+
+
+# --------------------------------------------------------------------------- operator
+
+class VP_OT_entry(Operator):
+    """The popup itself: invoke on the hovered field, collect input modally, apply once."""
+
+    bl_idname = 'value_precision.entry'
+    bl_label = 'Value Precision Entry'
+    bl_description = 'Type digits that are divided or multiplied by 10^n for the hovered number field'
+    bl_options = {'UNDO', 'INTERNAL'}  # UNDO: the confirmed write becomes one undo step
+
+    def invoke(self, context, event):
+        # Not over a usable field -> do nothing and let the key keep its normal meaning.
+        prop_tuple = getattr(context, 'property', None)
+        if prop_tuple is None or context.space_data is None or context.region is None:
+            return {'PASS_THROUGH'}
+        try:
+            self._target = Target(context, prop_tuple)
+            display = self._target.display()
+        except (ValueError, KeyError, AttributeError, TypeError, ReferenceError, RuntimeError):
+            return {'PASS_THROUGH'}
+
+        prefs = _prefs(context)
+        offset = prefs.offset if prefs else 0
+        whole = prefs.whole_shift if prefs else 0
+        remember = prefs.remember_last if prefs else True
+        self._passthrough = prefs.click_passthrough if prefs else True
+        self._trigger = event.type  # pressing the same key again confirms (unless it has another job)
+        finer = prefs.finer_key if prefs else 'X'
+        coarser = prefs.coarser_key if prefs else 'Z'
+        mode_key = prefs.mode_key if prefs else 'C'
+        self._finer = frozenset({finer}) | _FINER_EXTRA
+        self._coarser = frozenset({coarser}) | _COARSER_EXTRA
+        self._mode_key = mode_key
+
+        # Starting mode and exponent. Integers start in multiply mode (dividing them is
+        # pointless); floats with decimals are auto-detected; whole-number floats may reuse the
+        # last manual choice.
+        if self._target.is_int:
+            mode, shift = _MUL, 0
+        else:
+            mode, shift = _DIV, initial_shift(display, False, offset, whole)
+            if not count_decimals(display) and remember and _last_choice is not None:
+                mode, shift = _last_choice
+
+        # Everything the draw callback and modal need lives in a plain dict, so the draw
+        # handler never holds a reference to the operator instance.
+        self._state = {
+            'region': context.region.as_pointer(),
+            'mouse': (event.mouse_region_x, event.mouse_region_y),
+            'label': self._target.label,
+            'shift': shift,
+            'mode': mode,
+            'is_int': self._target.is_int,
+            'digits': '',
+            'negative': False,
+            'manual': False,       # True once the user changed mode or exponent by hand
+            'dragging': False,     # True while the mouse is scrubbing the bar
+            'slider': None,        # (left, bottom, width, height) of the bar, set by _draw
+            'mode_rects': None,    # ((÷ rect), (× rect)), set by _draw
+            'card': None,          # rectangle of the whole popup
+            'finer_name': key_name(finer),
+            'coarser_name': key_name(coarser),
+            'mode_name': key_name(mode_key),
+        }
+        self._space = type(context.space_data)
+        self._region_type = context.region.type
+        self._handle = self._space.draw_handler_add(_draw, (self._state,), self._region_type, 'POST_PIXEL')
+        context.window_manager.modal_handler_add(self)
+        context.region.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    # ---- helpers -----------------------------------------------------------------
+
+    def _cleanup(self, context) -> None:
+        """Remove the draw handler and refresh the screen. Safe to call more than once."""
+        handle = getattr(self, '_handle', None)
+        if handle is not None:
+            self._space.draw_handler_remove(handle, self._region_type)
+            self._handle = None
+        for area in context.screen.areas if context.screen else ():
+            area.tag_redraw()
+
+    def cancel(self, context):
+        """Called by Blender when the modal is aborted from outside (e.g. file load)."""
+        self._cleanup(context)
+
+    @staticmethod
+    def _inside(rect, x, y) -> bool:
+        return bool(rect) and rect[0] <= x < rect[0] + rect[2] and rect[1] <= y < rect[1] + rect[3]
+
+    @staticmethod
+    def _cell(state, x) -> int:
+        """Exponent under region x coordinate ``x`` on the bar (clamped to 0..9)."""
+        left, _bottom, width, _height = state['slider']
+        return max(0, min(_MAX_SHIFT, int((x - left) / (width / (_MAX_SHIFT + 1)))))
+
+    def _set_shift(self, context, value: int) -> None:
+        """Change the exponent by hand and remember that it was a manual override."""
+        self._state['shift'] = value
+        self._state['manual'] = True
+        context.region.tag_redraw()
+
+    def _set_mode(self, context, mode: str) -> None:
+        """Switch between divide and multiply (not available for integer fields)."""
+        if self._state['is_int']:
+            return
+        self._state['mode'] = mode
+        self._state['manual'] = True
+        context.region.tag_redraw()
+
+    def _confirm(self, context):
+        """Apply the typed value. Returns the operator result set."""
+        global _last_choice
+        state = self._state
+        # Remember a manual choice only when a value was actually typed with it.
+        if state['manual'] and not state['is_int'] and state['digits']:
+            _last_choice = (state['mode'], state['shift'])
+        value = shifted_value(state['negative'], state['digits'], state['shift'], state['mode'])
+        self._cleanup(context)
+        if value is None:
+            return {'CANCELLED'}  # nothing typed: leave the field untouched
+        try:
+            self._target.write(value)
+            self._target.autokey(context)
+        except (ReferenceError, AttributeError, TypeError, ValueError, RuntimeError, KeyError):
+            self.report({'ERROR'}, 'The field changed or became invalid')
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+    # ---- event handling ----------------------------------------------------------
+
+    def modal(self, context, event):
+        state = self._state
+        kind = event.type
+        x, y = event.mouse_region_x, event.mouse_region_y
+        moving = kind in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}
+
+        # 1. Scrubbing the bar takes priority over everything else.
+        if state['dragging']:
+            if moving:
+                self._set_shift(context, self._cell(state, x))
+                return {'RUNNING_MODAL'}
+            if kind == 'LEFTMOUSE' and event.value == 'RELEASE':
+                state['dragging'] = False
+                return {'RUNNING_MODAL'}
+
+        # 2. Plain mouse movement and timers pass through so the UI stays responsive.
+        if moving or kind in {'TIMER', 'TIMER_REPORT'}:
+            return {'PASS_THROUGH'}
+
+        # 3. Clicks: the ÷ / × switch, then the bar (starts scrubbing), then the rest of the
+        #    popup (ignored). A click outside the popup confirms (handled further down).
+        if kind == 'LEFTMOUSE' and event.value == 'PRESS':
+            if state['mode_rects']:
+                for rect, mode in zip(state['mode_rects'], (_DIV, _MUL)):
+                    if self._inside(rect, x, y):
+                        self._set_mode(context, mode)
+                        return {'RUNNING_MODAL'}
+            if state['slider'] and self._inside(state['slider'], x, y):
+                state['dragging'] = True
+                self._set_shift(context, self._cell(state, x))
+                return {'RUNNING_MODAL'}
+            if self._inside(state['card'], x, y):
+                return {'RUNNING_MODAL'}  # clicking the popup itself never confirms
+
+        # Everything below reacts to presses only; releases are swallowed.
+        if event.value != 'PRESS':
+            return {'RUNNING_MODAL'}
+
+        # 4. Cancel.
+        if kind in {'ESC', 'RIGHTMOUSE'}:
+            self._cleanup(context)
+            return {'CANCELLED'}
+
+        # 5. Confirm. The trigger key confirms too, except when it is also assigned to the
+        #    exponent or mode (e.g. trigger = Z with Z as "coarser"): then that job wins.
+        busy = kind in self._finer or kind in self._coarser or kind == self._mode_key
+        if kind in {'SPACE', 'RET', 'NUMPAD_ENTER'} or (kind == self._trigger and not busy
+                                                        and not event.is_repeat):
+            return self._confirm(context)
+        if kind == 'LEFTMOUSE':  # a click outside the popup
+            result = self._confirm(context)
+            if self._passthrough and 'FINISHED' in result:
+                return {'FINISHED', 'PASS_THROUGH'}  # also let the click do its normal job
+            return result
+
+        # 6. Typing, exponent and mode.
+        if kind in _DIGITS:
+            if len(state['digits']) < _MAX_DIGITS:
+                state['digits'] += _DIGITS[kind]
+        elif kind in {'MINUS', 'NUMPAD_MINUS'}:
+            state['negative'] = not state['negative']
+        elif kind == 'BACK_SPACE':
+            if state['digits']:
+                state['digits'] = state['digits'][:-1]
+            else:
+                state['negative'] = False  # nothing left to delete: clear the sign instead
+        elif kind in self._finer:
+            self._set_shift(context, min(_MAX_SHIFT, state['shift'] + 1))
+        elif kind in self._coarser:
+            self._set_shift(context, max(0, state['shift'] - 1))
+        elif kind == self._mode_key:
+            self._set_mode(context, _DIV if state['mode'] == _MUL else _MUL)
+        else:
+            return {'RUNNING_MODAL'}  # unknown key: swallow it so nothing leaks to the editor
+        context.region.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+
+# --------------------------------------------------------------------------- sliding
+
+def step_size(shift: int, mode: str) -> Decimal:
+    """Size of one slide step: 10^-shift in divide mode, 10^shift in multiply mode (exact)."""
+    return Decimal(1).scaleb(shift if mode == _MUL else -shift)
+
+
+def slide_value(original: float, step: Decimal, ticks: int) -> Optional[float]:
+    """Value after dragging ``ticks`` whole steps away from ``original``, on the step grid.
+
+    * ``ticks == 0`` returns None: the value is left exactly as it was.
+    * If ``original`` already sits on the grid, the result is original + ticks * step.
+    * If it does not (0.0537 with step 0.001), the first tick in each direction lands on the
+      nearest grid value in that direction (0.054 up, 0.053 down) and the rest follow.
+
+    Whole-grid indices times an exact Decimal step avoid float noise like 0.30000000000000004.
+    """
+    if ticks == 0:
+        return None
+    ratio = original / float(step)
+    nearest = round(ratio)
+    tolerance = max(1e-3, abs(ratio) * 1e-6)  # float32 storage is slightly off-grid
+    if abs(ratio - nearest) <= tolerance:
+        index = nearest + ticks
+    elif ticks > 0:
+        index = math.ceil(ratio) + ticks - 1
+    else:
+        index = math.floor(ratio) + ticks + 1
+    return float(Decimal(index) * step)
+
+
+def _region_at(window, point):
+    """The (area, region) under window coordinates ``point``.
+
+    Keymap handlers run in the window's context, not the hovered region's, so the region is
+    looked up by position. Narrow regions (header, sidebar) are checked before the main one.
+    """
+    for area in window.screen.areas:
+        for region in sorted(area.regions, key=lambda r: r.type == 'WINDOW'):
+            if region.type not in {'WINDOW', 'UI', 'HEADER', 'TOOL_HEADER'} or region.width < 2:
+                continue
+            if (region.x <= point[0] < region.x + region.width
+                    and region.y <= point[1] < region.y + region.height):
+                return area, region
+    return None, None
+
+
+def _draw_slide(state: dict) -> None:
+    """POST_PIXEL draw callback for the slide HUD (field name, live value, current step)."""
+    context = bpy.context
+    region = context.region
+    if region is None or region.as_pointer() != state['region']:
+        return
+    prefs = context.preferences
+    ui = prefs.themes[0].user_interface
+    menu, item = ui.wcol_menu_back, ui.wcol_menu_item
+    scale = max(.25, float(prefs.system.ui_scale))
+    base = float(prefs.ui_styles[0].widget.points) * scale
+    big, small = base * 1.5, base * .85
+    text_c, text_sel = _rgba(item.text), _rgba(item.text_sel)
+    selected, inner = _rgba(item.inner_sel), _rgba(menu.inner)
+
+    operator = '×' if state['mode'] == _MUL else '÷'
+    step_text = format(step_size(state['eff_shift'], state['mode']), 'f')
+    title = state['label']
+    main = state['value_text']
+    step_line = f"step   {operator} 10^{state['eff_shift']}   =   {step_text}"
+    hint = (f"{state['finer_name']} / {state['coarser_name']}: step   "
+            f"{state['mode_name']}: ÷ ×   Shift: finer   Esc: cancel")
+
+    pad = 10 * scale
+    blf.size(0, base)
+    widths = [blf.dimensions(0, title)[0], blf.dimensions(0, step_line)[0]]
+    blf.size(0, big)
+    widths.append(blf.dimensions(0, main)[0])
+    blf.size(0, small)
+    widths.append(blf.dimensions(0, hint)[0])
+    width = max(widths) + pad * 2
+    heights = (small * 1.7, base * 1.7, big * 1.7, base * 1.6)  # bottom -> top
+    height = sum(heights) + pad
+    left = min(max(state['mouse'][0] + 12 * scale, 2), max(2, region.width - width - 2))
+    bottom = min(max(state['mouse'][1] + 12 * scale, 2), max(2, region.height - height - 2))
+    radius = base * 1.6 * min(1.0, max(0.0, float(menu.roundness))) * .5
+
+    gpu.state.blend_set('ALPHA')
+    _fill(left, bottom, width, height, _rgba(menu.outline), radius)
+    inset = max(1.0, scale)
+    _fill(left + inset, bottom + inset, width - inset * 2, height - inset * 2, inner, max(0.0, radius - inset))
+    y = bottom + pad * .5
+    _text(hint, small, (left, y, width, heights[0]), _mix(text_c, inner, .35), pad=pad)
+    y += heights[0]
+    _text(step_line, base, (left, y, width, heights[1]), text_c, pad=pad)
+    y += heights[1]
+    _fill(left + inset * 2, y, width - inset * 4, heights[2], selected, radius * .8)
+    _text(main, big, (left, y, width, heights[2]), text_sel, pad=pad)
+    y += heights[2]
+    _text(title, base, (left, y, width, heights[3]), text_c, pad=pad)
+    gpu.state.blend_set('NONE')
+
+
+_SLIDE_ERRORS = (ReferenceError, AttributeError, TypeError, ValueError, RuntimeError, KeyError)
+
+
+class VP_OT_slide(Operator):
+    """Middle-mouse sliding: write live while dragging, restore on cancel, commit on release."""
+
+    bl_idname = 'value_precision.slide'
+    bl_label = 'Value Precision Slide'
+    bl_description = 'Hold middle mouse over a number field and drag to change it in clean steps'
+    bl_options = {'UNDO', 'INTERNAL'}  # one undo step, pushed only when the slide is committed
+
+    def invoke(self, context, event):
+        global _sliding
+        window = context.window
+        if _sliding or window is None or event.type != 'MIDDLEMOUSE' or event.value != 'PRESS':
+            return {'PASS_THROUGH'}
+        prefs = _prefs(context)
+        if prefs is not None and not prefs.slide_enabled:
+            return {'PASS_THROUGH'}
+        area, region = _region_at(window, (event.mouse_x, event.mouse_y))
+        if area is None:
+            return {'PASS_THROUGH'}
+        try:
+            # The hovered button is only visible from inside its own region.
+            with context.temp_override(window=window, area=area, region=region):
+                if getattr(bpy.context, 'region_popup', None) is not None:
+                    return {'PASS_THROUGH'}
+                self._target = Target(bpy.context, getattr(bpy.context, 'property', None))
+                display = self._target.display()
+                original_raw = self._target.raw()
+        except _SLIDE_ERRORS:
+            return {'PASS_THROUGH'}  # not a numeric field: native middle-mouse (panning) continues
+
+        offset = prefs.slide_offset if prefs else 0
+        whole = prefs.slide_whole_shift if prefs else 0
+        remember = prefs.slide_remember_last if prefs else True
+        finer = prefs.finer_key if prefs else 'X'
+        coarser = prefs.coarser_key if prefs else 'Z'
+        mode_key = prefs.mode_key if prefs else 'C'
+        self._finer = frozenset({finer}) | _FINER_EXTRA
+        self._coarser = frozenset({coarser}) | _COARSER_EXTRA
+        self._mode_key = mode_key
+        pixels = prefs.pixels_per_step if prefs else 12.0
+        self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
+
+        # Same starting-step logic as typing, with its own preferences and memory.
+        if self._target.is_int:
+            mode, shift = _MUL, 0
+        else:
+            mode, shift = _DIV, initial_shift(display, False, offset, whole)
+            if not count_decimals(display) and remember and _last_slide_choice is not None:
+                mode, shift = _last_slide_choice
+
+        self._original_raw = original_raw
+        self._expected = original_raw       # what we last wrote (for the re-apply timer)
+        self._base = display                # value the current drag distance is measured from
+        self._base_raw = original_raw       # the same value in stored units (exact)
+        self._anchor_x = event.mouse_x      # where that measurement starts
+        self._ticks = 0
+        self._state = {
+            'region': region.as_pointer(),
+            'mouse': (event.mouse_x - region.x, event.mouse_y - region.y),
+            'label': self._target.label,
+            'shift': shift,                 # step exponent chosen by detection / keys
+            'eff_shift': shift,             # exponent actually used (adds the Shift-held bonus)
+            'fine': False,                  # True while Shift is held
+            'fine_extra': prefs.slide_fine_offset if prefs else 1,
+            'mode': mode,
+            'is_int': self._target.is_int,
+            'manual': False,
+            'value_text': '',
+            'finer_name': key_name(finer),
+            'coarser_name': key_name(coarser),
+            'mode_name': key_name(mode_key),
+        }
+        self._refresh_text()
+        self._space = type(area.spaces.active)
+        self._region_type = region.type
+        self._handle = self._space.draw_handler_add(_draw_slide, (self._state,), self._region_type, 'POST_PIXEL')
+        # Timer: re-apply our value while sliding, as animation evaluation can overwrite it.
+        self._timer = context.window_manager.event_timer_add(.1, window=window)
+        _sliding = True
+        context.window_manager.modal_handler_add(self)
+        region.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    # ---- helpers -----------------------------------------------------------------
+
+    def _refresh_text(self) -> None:
+        """Format the live value for the HUD (never fewer decimals than the step shows)."""
+        state = self._state
+        try:
+            value = self._target.display()
+            decimals = max(0 if state['mode'] == _MUL else state['eff_shift'], count_decimals(value))
+            state['value_text'] = f'{value:.{decimals}f}'
+        except _SLIDE_ERRORS:
+            pass
+
+    def _cleanup(self, context) -> None:
+        """Remove the handler and timer and refresh the screen. Safe to call twice."""
+        global _sliding
+        _sliding = False
+        handle = getattr(self, '_handle', None)
+        if handle is not None:
+            self._space.draw_handler_remove(handle, self._region_type)
+            self._handle = None
+        timer = getattr(self, '_timer', None)
+        if timer is not None:
+            context.window_manager.event_timer_remove(timer)
+            self._timer = None
+        for area in context.screen.areas if context.screen else ():
+            area.tag_redraw()
+
+    def _restore(self) -> None:
+        """Put the original value back (cancel path); failures are ignored on purpose."""
+        try:
+            self._target.write_raw(self._original_raw)
+        except _SLIDE_ERRORS:
+            pass
+
+    def cancel(self, context):
+        """Called by Blender if the modal is aborted from outside (file load, window closed)."""
+        self._restore()
+        self._cleanup(context)
+
+    def _update_effective(self) -> None:
+        """Exponent in use: the chosen one, plus the Shift bonus (a smaller step) while held.
+
+        The bonus is temporary and never stored, so it cannot accumulate between slides.
+        """
+        state = self._state
+        extra = state['fine_extra'] if state['fine'] and not state['is_int'] else 0
+        # Finer means a smaller step: a bigger exponent when dividing, a smaller one when multiplying.
+        shift = state['shift'] + extra if state['mode'] == _DIV else state['shift'] - extra
+        state['eff_shift'] = max(0, min(_MAX_SHIFT, shift))
+
+    def _reanchor(self, context, event) -> None:
+        """Continue the drag from the current value, so a step change never makes it jump."""
+        self._base = self._target.display()
+        self._base_raw = self._expected = self._target.raw()
+        self._anchor_x = event.mouse_x
+        self._ticks = 0
+        self._refresh_text()
+        self._redraw(context)
+
+    def _set_step(self, context, event, *, shift=None, mode=None) -> None:
+        """Change the step mid-drag; the drag continues from the current value at the new step."""
+        state = self._state
+        if mode is not None:
+            state['mode'] = mode
+        if shift is not None:
+            state['shift'] = shift
+        state['manual'] = True
+        self._update_effective()
+        self._reanchor(context, event)
+
+    def _apply_drag(self, context, event) -> None:
+        """Write the value for the current horizontal distance (whole steps only)."""
+        ticks = math.trunc((event.mouse_x - self._anchor_x) / self._pixels)
+        if ticks == self._ticks:
+            return
+        self._ticks = ticks
+        step = step_size(self._state['eff_shift'], self._state['mode'])
+        value = slide_value(self._base, step, ticks)
+        if value is None:
+            self._target.write_raw(self._base_raw)      # back at the anchor: unchanged value
+        else:
+            self._target.write(value)
+        self._expected = self._target.raw()             # read back: includes clamping / float32
+        self._refresh_text()
+        self._redraw(context)
+
+    @staticmethod
+    def _redraw(context) -> None:
+        """The HUD may live in a different area than the one under the cursor; refresh all."""
+        for area in context.screen.areas if context.screen else ():
+            area.tag_redraw()
+
+    # ---- event handling ----------------------------------------------------------
+
+    def modal(self, context, event):
+        global _last_slide_choice
+        state = self._state
+        kind = event.type
+        try:
+            if kind == 'WINDOW_DEACTIVATE' or (kind in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS'):
+                self._restore()
+                self._cleanup(context)
+                return {'CANCELLED'}
+
+            if kind == 'MIDDLEMOUSE' and event.value == 'RELEASE':
+                changed = self._target.raw() != self._original_raw
+                if changed:
+                    self._target.autokey(context)       # keyframe once, like a native edit
+                    if state['manual'] and not state['is_int']:
+                        _last_slide_choice = (state['mode'], state['shift'])
+                self._cleanup(context)
+                return {'FINISHED'} if changed else {'CANCELLED'}
+
+            # Holding Shift makes the step one decimal finer; every event carries the key state,
+            # so pressing or releasing it mid-drag is picked up immediately.
+            if event.shift != state['fine']:
+                state['fine'] = event.shift
+                self._update_effective()
+                self._reanchor(context, event)
+
+            if kind in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
+                self._apply_drag(context, event)
+            elif kind == 'TIMER':
+                if self._target.raw() != self._expected:
+                    self._target.write_raw(self._expected)
+            elif event.value == 'PRESS':
+                if kind in self._finer:
+                    self._set_step(context, event, shift=min(_MAX_SHIFT, state['shift'] + 1))
+                elif kind in self._coarser:
+                    self._set_step(context, event, shift=max(0, state['shift'] - 1))
+                elif kind == self._mode_key and not state['is_int']:
+                    self._set_step(context, event, mode=_DIV if state['mode'] == _MUL else _MUL)
+        except _SLIDE_ERRORS:
+            self.report({'WARNING'}, 'The field changed during the slide; the original value was restored')
+            self._restore()
+            self._cleanup(context)
+            return {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+
+# --------------------------------------------------------------------------- registration
+
+_CLASSES = (VP_Preferences, VP_OT_capture_key, VP_OT_entry, VP_OT_slide)
+
+
+def register():
+    for cls in _CLASSES:
+        bpy.utils.register_class(cls)
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig is None:  # background mode has no key configuration
+        return
+    # "User Interface" is consulted when the pointer is over a button, which is what makes
+    # context.property available to invoke(); the default trigger is the grave accent key (`).
+    keymap = keyconfig.keymaps.new('User Interface', space_type='EMPTY', region_type='WINDOW')
+    item = keymap.keymap_items.new(VP_OT_entry.bl_idname, 'ACCENT_GRAVE', 'PRESS')
+    _KEYMAPS.append((keymap, item))
+    # Middle mouse: View2D handles it first for panning (sidebars, Properties, node editor), so
+    # the slide entry goes to the head of those keymaps. Anything that is not a numeric field
+    # returns PASS_THROUGH and native panning continues.
+    for name in ('View2D Buttons List', 'View2D', 'Window'):
+        keymap = keyconfig.keymaps.new(name=name, space_type='EMPTY')
+        item = keymap.keymap_items.new(VP_OT_slide.bl_idname, 'MIDDLEMOUSE', 'PRESS', head=True)
+        _KEYMAPS.append((keymap, item))
+
+
+def unregister():
+    global _shader
+    for keymap, item in _KEYMAPS:
+        keymap.keymap_items.remove(item)
+    _KEYMAPS.clear()
+    for cls in reversed(_CLASSES):
+        bpy.utils.unregister_class(cls)
+    _shader = None  # drop the cached GPU shader wrapper
+
+
+if __name__ == '__main__':
+    register()
