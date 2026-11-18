@@ -4,7 +4,7 @@ bl_info = {
     "version": (0, 4, 0),
     "blender": (4, 2, 0),
     "location": "Hover a number field: press ` to type, hold middle mouse to slide",
-    "description": "Type digits (5 with ÷10^3 = 0.005) or slide values in clean 10^n steps",
+    "description": "Enter digits at a defined precision (e.g. 5 with ÷10³ = 0.005), or use the Middle Mouse Button to adjust values in clean 10ⁿ steps by scrolling.",
     "category": "Interface",
 }
 
