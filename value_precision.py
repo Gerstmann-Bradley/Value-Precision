@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Value Precision",
-    "author": "",
+    "author": "Bradley Animation",
     "version": (0, 5, 0),
     "blender": (4, 2, 0),
     "location": "Hover a number field: press ` to type, hold middle mouse to slide",
-    "description": "Type digits (5 with ÷10^3 = 0.005) or slide values in clean 10^n steps",
+    "description": "Type digits for exact decimals, slide values in clean steps.",
     "category": "Interface",
 }
 
