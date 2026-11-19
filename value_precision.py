@@ -87,6 +87,10 @@ class VP_Preferences(AddonPreferences):
     finer_key: StringProperty(name='Finer Key', description='Increase the exponent (more decimals)', default='X')
     mode_key: StringProperty(name='Mode Key', description='Switch between divide and multiply', default='C')
     sign_key: StringProperty(name='Sign Key', description='Switch between positive and negative', default='V')
+    all_key: StringProperty(
+        name='All Axes Key',
+        description='Toggle applying the change to every axis of a vector, while typing or sliding',
+        default='A')
     auto_sign: BoolProperty(
         name='Detect Sign',
         description='Start typing with the sign of the current value, so a negative field gives a negative result',
@@ -96,6 +100,11 @@ class VP_Preferences(AddonPreferences):
         name='Middle Mouse Sliding',
         description='Hold the middle mouse button over a number field and drag to change it in clean steps',
         default=True)
+    slide_alt: BoolProperty(
+        name='Require Alt to Slide',
+        description='Slide only with Alt + middle mouse, so plain middle mouse always pans. '
+                    'Alt only has to be held when you press the button, not during the drag',
+        default=False)
     slide_offset: IntProperty(
         name='Slide Auto-detect Offset',
         description='Added to the number of decimals found in the current value to pick the slide step. '
@@ -130,6 +139,7 @@ class VP_Preferences(AddonPreferences):
         slide = layout.box()
         slide.label(text='Sliding (hold middle mouse over a field and drag)')
         slide.prop(self, 'slide_enabled')
+        slide.prop(self, 'slide_alt')
         slide.prop(self, 'slide_offset')
         slide.prop(self, 'slide_fine_offset')
         slide.prop(self, 'slide_whole_shift')
@@ -142,7 +152,8 @@ class VP_Preferences(AddonPreferences):
         for attr, label in (('coarser_key', 'Coarser (smaller exponent)'),
                             ('finer_key', 'Finer (bigger exponent)'),
                             ('mode_key', 'Switch ÷ / ×'),
-                            ('sign_key', 'Switch + / −')):
+                            ('sign_key', 'Switch + / −'),
+                            ('all_key', 'All axes (vectors)')):
             row = box.row(align=True)
             row.label(text=label)
             op = row.operator(VP_OT_capture_key.bl_idname, text=key_name(getattr(self, attr)))
@@ -201,7 +212,7 @@ class VP_OT_capture_key(Operator):
             return {'CANCELLED'}
         prefs = _prefs(context)
         if prefs is not None:
-            others = ({prefs.coarser_key, prefs.finer_key, prefs.mode_key, prefs.sign_key}
+            others = ({prefs.coarser_key, prefs.finer_key, prefs.mode_key, prefs.sign_key, prefs.all_key}
                       - {getattr(prefs, self.target)})
             if event.type in others:
                 self.report({'WARNING'}, f'{key_name(event.type)} is already used by another action')
@@ -307,6 +318,17 @@ class Target:
         if self.array and index < 0:
             raise ValueError('Hover a single component')  # whole-vector widgets (colour swatches ...)
         self.index = max(0, index)
+        # "All axes" only makes sense for a flat vector (not a matrix) with several components.
+        self.multi = False
+        if self.array:
+            try:
+                # Blender pads array_dimensions to three entries: (3, 0, 0) for a vector,
+                # (4, 4, 0) for a matrix. Only the non-zero entries are real dimensions.
+                dims = getattr(prop, 'array_dimensions', None)
+                flat = self.custom or dims is None or sum(1 for d in dims if d) <= 1
+                self.multi = bool(flat and self.count() > 1)
+            except (AttributeError, TypeError, ReferenceError):
+                pass
         self.label = self._label(prop)
 
     def _label(self, prop) -> str:
@@ -362,6 +384,45 @@ class Target:
         if owner is not None:
             owner.update_tag()  # make sure the owning ID is flagged for undo and depsgraph
 
+    def count(self) -> int:
+        """Number of components: 1 for a scalar, 3 for a location, 4 for a colour ..."""
+        if not self.array:
+            return 1
+        return len(self.pointer[self.name] if self.custom else getattr(self.pointer, self.name))
+
+    def to_display(self, raw_value: float) -> float:
+        """Stored value -> value as shown (radians -> degrees for rotations)."""
+        return math.degrees(raw_value) if self.rotation else raw_value
+
+    def to_raw(self, display_value: float) -> float:
+        """Value as shown -> stored value (degrees -> radians for rotations)."""
+        return math.radians(display_value) if self.rotation else display_value
+
+    def raw_values(self) -> list:
+        """Stored values of every component (a one-item list for a scalar)."""
+        value = self.pointer[self.name] if self.custom else getattr(self.pointer, self.name)
+        return [value[i] for i in range(len(value))] if self.array else [value]
+
+    def write_raw_values(self, values) -> None:
+        """Store exact stored values for every component, one by one.
+
+        Components are assigned individually (not by replacing the whole property) so custom
+        properties keep their UI settings such as min / max.
+        """
+        if not self.array:
+            self.write_raw(values[0])
+            return
+        array = self.pointer[self.name] if self.custom else getattr(self.pointer, self.name)
+        for i, value in enumerate(values):
+            array[i] = int(round(value)) if self.is_int else value
+        owner = self.pointer.id_data
+        if owner is not None:
+            owner.update_tag()
+
+    def write_all(self, display_value: float) -> None:
+        """Store the same value (in display units) in every component."""
+        self.write_raw_values([self.to_raw(display_value)] * self.count())
+
     def write_raw(self, raw_value: float) -> None:
         """Store an exact stored value (no unit conversion); used to restore or re-apply."""
         if self.array:
@@ -375,7 +436,7 @@ class Target:
         if owner is not None:
             owner.update_tag()
 
-    def autokey(self, context) -> None:
+    def autokey(self, context, index=None) -> None:
         """Mirror native behaviour: with Auto Keying on, only update channels already animated.
 
         Driven channels are skipped. Any failure is ignored on purpose: the value is already
@@ -389,7 +450,10 @@ class Target:
                 return
             path = self.pointer.path_from_id('["' + bpy.utils.escape_identifier(self.name) + '"]'
                                              if self.custom else self.name)
-            index = self.index if self.array else -1
+            if index is None:
+                index = self.index
+            if not self.array:
+                index = -1  # a scalar has a single channel
             animated = any(f.data_path == path and (index < 0 or f.array_index == index)
                            for f in animation.action.fcurves)
             if animated and not any(d.data_path == path for d in animation.drivers):
@@ -485,7 +549,8 @@ def _draw(state: dict) -> None:
     title = state['label']
     # Coarser key first, finer key second: left to right matches the direction of the bar.
     hint_keys = (f"{state['coarser_name']} / {state['finer_name']}: exponent   "
-                 f"{state['mode_name']}: ÷ ×   {state['sign_name']}: + −")
+                 f"{state['mode_name']}: ÷ ×   {state['sign_name']}: + −"
+                 + (f"   {state['all_name']}: all" if state['multi'] else ''))
     hint_actions = 'Space: apply   RMB: cancel'
     has_mode = not state['is_int']  # integer fields are always multiply
 
@@ -493,7 +558,8 @@ def _draw(state: dict) -> None:
     pad = 10 * scale
     gap = pad * .5
     blf.size(0, base)
-    title_w = blf.dimensions(0, title)[0]
+    all_w = blf.dimensions(0, 'All Axes')[0] + pad * 1.4  # width of the note beside the title of vector fields
+    title_w = blf.dimensions(0, title)[0] + ((gap + all_w) if state['multi'] else 0)
     blf.size(0, big)
     main_w = blf.dimensions(0, main)[0]
     blf.size(0, small)
@@ -563,6 +629,14 @@ def _draw(state: dict) -> None:
     _text(main, big, (left, y, width, heights[3]), text_sel, pad=pad)
     y += heights[3]
     _text(title, base, (left, y, width, heights[4]), text_c, pad=pad)
+    state['all_rect'] = None
+    if state['multi']:
+        # "All Axes" note at the right end of the title row (lit when on): type once, set every axis.
+        rect = (left + width - pad - all_w, y + base * .15, all_w, heights[4] - base * .3)
+        state['all_rect'] = rect
+        on = state['all_axes']
+        _fill(*rect, selected if on else track_bg, radius * .6)
+        _text('All Axes', base, rect, text_sel if on else text_c, 'CENTER')
     gpu.state.blend_set('NONE')
 
 
@@ -601,6 +675,8 @@ class VP_OT_entry(Operator):
         self._mode_key = mode_key
         sign_key = prefs.sign_key if prefs else 'V'
         self._sign_key = sign_key
+        all_key = prefs.all_key if prefs else 'A'
+        self._all_key = all_key
         # The result takes the sign of the current value (zero counts as positive).
         negative = bool(prefs.auto_sign if prefs else True) and display < 0
 
@@ -636,6 +712,10 @@ class VP_OT_entry(Operator):
             'finer_name': key_name(finer),
             'mode_name': key_name(mode_key),
             'sign_name': key_name(sign_key),
+            'multi': self._target.multi,   # hovered field is one axis of a vector
+            'all_axes': False,             # apply the typed value to every axis
+            'all_rect': None,              # rectangle of the "All" toggle, set by _draw
+            'all_name': key_name(all_key),
         }
         self._space = type(context.space_data)
         self._region_type = context.region.type
@@ -695,8 +775,13 @@ class VP_OT_entry(Operator):
         if value is None:
             return {'CANCELLED'}  # nothing typed: leave the field untouched
         try:
-            self._target.write(value)
-            self._target.autokey(context)
+            if state['all_axes'] and state['multi']:
+                self._target.write_all(value)
+                for axis in range(self._target.count()):
+                    self._target.autokey(context, axis)
+            else:
+                self._target.write(value)
+                self._target.autokey(context)
         except (ReferenceError, AttributeError, TypeError, ValueError, RuntimeError, KeyError):
             self.report({'ERROR'}, 'The field changed or became invalid')
             return {'CANCELLED'}
@@ -731,6 +816,10 @@ class VP_OT_entry(Operator):
                     if self._inside(rect, x, y):
                         self._set_mode(context, mode)
                         return {'RUNNING_MODAL'}
+            if state['all_rect'] and self._inside(state['all_rect'], x, y):
+                state['all_axes'] = not state['all_axes']
+                context.region.tag_redraw()
+                return {'RUNNING_MODAL'}
             if state['sign_rects']:
                 for rect, negative in zip(state['sign_rects'], (False, True)):
                     if self._inside(rect, x, y):
@@ -756,7 +845,7 @@ class VP_OT_entry(Operator):
         # 5. Confirm. The trigger key confirms too, except when it is also assigned to the
         #    exponent or mode (e.g. trigger = Z with Z as "coarser"): then that job wins.
         busy = (kind in self._coarser or kind in self._finer
-                or kind in {self._mode_key, self._sign_key})
+                or kind in {self._mode_key, self._sign_key, self._all_key})
         if kind in {'SPACE', 'RET', 'NUMPAD_ENTER'} or (kind == self._trigger and not busy
                                                         and not event.is_repeat):
             return self._confirm(context)
@@ -780,6 +869,8 @@ class VP_OT_entry(Operator):
             self._set_shift(context, min(_TYPE_MAX_SHIFT, state['shift'] + 1))
         elif kind == self._mode_key:
             self._set_mode(context, _DIV if state['mode'] == _MUL else _MUL)
+        elif kind == self._all_key and state['multi']:
+            state['all_axes'] = not state['all_axes']
         else:
             return {'RUNNING_MODAL'}  # unknown key: swallow it so nothing leaks to the editor
         context.region.tag_redraw()
@@ -853,12 +944,15 @@ def _draw_slide(state: dict) -> None:
     title = state['label']
     main = state['value_text']
     step_line = f"step   {operator} 10^{state['eff_shift']}   =   {step_text}"
-    hint = (f"{state['coarser_name']} / {state['finer_name']}: step   "
-            f"{state['mode_name']}: ÷ ×   Shift: finer   RMB: cancel")
+    hint = (f"{state['coarser_name']} / {state['finer_name']}: step   {state['mode_name']}: ÷ ×   "
+            + (f"{state['all_name']}: all axes   " if state['multi'] else '')
+            + "Shift: finer   RMB: cancel")
 
     pad = 10 * scale
     blf.size(0, base)
-    widths = [blf.dimensions(0, title)[0], blf.dimensions(0, step_line)[0]]
+    all_w = blf.dimensions(0, 'All Axes')[0] + pad * 1.4  # the same note as in the typing popup
+    widths = [blf.dimensions(0, title)[0] + ((pad * .5 + all_w) if state['multi'] else 0),
+              blf.dimensions(0, step_line)[0]]
     blf.size(0, big)
     widths.append(blf.dimensions(0, main)[0])
     blf.size(0, small)
@@ -883,6 +977,12 @@ def _draw_slide(state: dict) -> None:
     _text(main, big, (left, y, width, heights[2]), text_sel, pad=pad)
     y += heights[2]
     _text(title, base, (left, y, width, heights[3]), text_c, pad=pad)
+    if state['multi']:
+        # Same note as in the typing popup: top right, lit while all axes move together.
+        rect = (left + width - pad - all_w, y + base * .15, all_w, heights[3] - base * .3)
+        on = state['all_axes']
+        _fill(*rect, selected if on else _mix(inner, _rgba(menu.outline), .35), radius * .6)
+        _text('All Axes', base, rect, text_sel if on else text_c, 'CENTER')
     gpu.state.blend_set('NONE')
 
 
@@ -905,6 +1005,11 @@ class VP_OT_slide(Operator):
         prefs = _prefs(context)
         if prefs is not None and not prefs.slide_enabled:
             return {'PASS_THROUGH'}
+        # The keymap item matches every modifier combination; the preference decides here.
+        # Ctrl and Shift always mean something else (zoom, pan), so they never start a slide.
+        # Alt is read only now, at the press: once the slide runs, it is not looked at again.
+        if event.ctrl or event.shift or event.alt != bool(prefs.slide_alt if prefs else False):
+            return {'PASS_THROUGH'}
         area, region = _region_at(window, (event.mouse_x, event.mouse_y))
         if area is None:
             return {'PASS_THROUGH'}
@@ -916,6 +1021,7 @@ class VP_OT_slide(Operator):
                 self._target = Target(bpy.context, getattr(bpy.context, 'property', None))
                 display = self._target.display()
                 original_raw = self._target.raw()
+                original_all = self._target.raw_values()
         except _SLIDE_ERRORS:
             return {'PASS_THROUGH'}  # not a numeric field: native middle-mouse (panning) continues
 
@@ -928,6 +1034,8 @@ class VP_OT_slide(Operator):
         self._coarser = frozenset({coarser}) | _COARSER_EXTRA
         self._finer = frozenset({finer}) | _FINER_EXTRA
         self._mode_key = mode_key
+        all_key = prefs.all_key if prefs else 'A'
+        self._all_key = all_key
         pixels = prefs.pixels_per_step if prefs else 12.0
         self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
 
@@ -939,10 +1047,11 @@ class VP_OT_slide(Operator):
             if not count_decimals(display) and remember and _last_slide_choice is not None:
                 mode, shift = _last_slide_choice
 
-        self._original_raw = original_raw
-        self._expected = original_raw       # what we last wrote (for the re-apply timer)
+        self._original_all = original_all           # every axis as it was (restored on cancel)
+        self._expected_all = list(original_all)     # what we last wrote (for the re-apply timer)
         self._base = display                # value the current drag distance is measured from
         self._base_raw = original_raw       # the same value in stored units (exact)
+        self._original_display = display            # hovered axis as it was, in display units
         self._anchor_x = event.mouse_x      # where that measurement starts
         self._ticks = 0
         self._state = {
@@ -960,6 +1069,9 @@ class VP_OT_slide(Operator):
             'coarser_name': key_name(coarser),
             'finer_name': key_name(finer),
             'mode_name': key_name(mode_key),
+            'multi': self._target.multi,    # hovered field is one axis of a vector
+            'all_axes': False,              # move every axis together
+            'all_name': key_name(all_key),
         }
         self._refresh_text()
         self._space = type(area.spaces.active)
@@ -1002,7 +1114,7 @@ class VP_OT_slide(Operator):
     def _restore(self) -> None:
         """Put the original value back (cancel path); failures are ignored on purpose."""
         try:
-            self._target.write_raw(self._original_raw)
+            self._target.write_raw_values(self._original_all)
         except _SLIDE_ERRORS:
             pass
 
@@ -1025,7 +1137,8 @@ class VP_OT_slide(Operator):
     def _reanchor(self, context, event) -> None:
         """Continue the drag from the current value, so a step change never makes it jump."""
         self._base = self._target.display()
-        self._base_raw = self._expected = self._target.raw()
+        self._base_raw = self._target.raw()
+        self._expected_all = self._target.raw_values()
         self._anchor_x = event.mouse_x
         self._ticks = 0
         self._refresh_text()
@@ -1042,6 +1155,31 @@ class VP_OT_slide(Operator):
         self._update_effective()
         self._reanchor(context, event)
 
+    def _follow(self) -> None:
+        """Make every other axis follow the hovered axis' total change since the drag began.
+
+        Each other axis = its original value + (hovered now - hovered originally). Axes that
+        started apart stay apart by the same amount; axes that started equal stay equal. Using
+        the total change, not the change since A was pressed, means pressing A after sliding
+        one axis brings the others along at once.
+        """
+        target = self._target
+        delta = target.display() - self._original_display
+        current = target.raw_values()
+        target.write_raw_values([
+            current[axis] if axis == target.index else target.to_raw(target.to_display(raw) + delta)
+            for axis, raw in enumerate(self._original_all)])
+
+    def _write_drag(self, value) -> None:
+        """Write one drag result: ``value`` is the hovered axis in display units, None = back at the anchor."""
+        target = self._target
+        if value is None:
+            target.write_raw(self._base_raw)    # back at the anchor: exactly as it was
+        else:
+            target.write(value)
+        if self._state['all_axes'] and target.multi:
+            self._follow()
+
     def _apply_drag(self, context, event) -> None:
         """Write the value for the current horizontal distance (whole steps only)."""
         ticks = math.trunc((event.mouse_x - self._anchor_x) / self._pixels)
@@ -1050,11 +1188,8 @@ class VP_OT_slide(Operator):
         self._ticks = ticks
         step = step_size(self._state['eff_shift'], self._state['mode'])
         value = slide_value(self._base, step, ticks)
-        if value is None:
-            self._target.write_raw(self._base_raw)      # back at the anchor: unchanged value
-        else:
-            self._target.write(value)
-        self._expected = self._target.raw()             # read back: includes clamping / float32
+        self._write_drag(value)
+        self._expected_all = self._target.raw_values()  # read back: includes clamping / float32
         self._refresh_text()
         self._redraw(context)
 
@@ -1077,9 +1212,13 @@ class VP_OT_slide(Operator):
                 return {'CANCELLED'}
 
             if kind == 'MIDDLEMOUSE' and event.value == 'RELEASE':
-                changed = self._target.raw() != self._original_raw
+                now = self._target.raw_values()
+                changed = now != self._original_all
                 if changed:
-                    self._target.autokey(context)       # keyframe once, like a native edit
+                    # Keyframe each changed axis once, like a native edit.
+                    for axis, (before, after) in enumerate(zip(self._original_all, now)):
+                        if before != after:
+                            self._target.autokey(context, axis)
                     if state['manual'] and not state['is_int']:
                         _last_slide_choice = (state['mode'], state['shift'])
                 self._cleanup(context)
@@ -1095,8 +1234,8 @@ class VP_OT_slide(Operator):
             if kind in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
                 self._apply_drag(context, event)
             elif kind == 'TIMER':
-                if self._target.raw() != self._expected:
-                    self._target.write_raw(self._expected)
+                if self._target.raw_values() != self._expected_all:
+                    self._target.write_raw_values(self._expected_all)
             elif event.value == 'PRESS':
                 if kind in self._coarser:
                     self._set_step(context, event, shift=max(0, state['shift'] - 1))
@@ -1104,6 +1243,13 @@ class VP_OT_slide(Operator):
                     self._set_step(context, event, shift=min(_MAX_SHIFT, state['shift'] + 1))
                 elif kind == self._mode_key and not state['is_int']:
                     self._set_step(context, event, mode=_DIV if state['mode'] == _MUL else _MUL)
+                elif kind == self._all_key and state['multi']:
+                    # Toggle moving all axes. Switching on brings the other axes along right away;
+                    # switching off leaves them where they are.
+                    state['all_axes'] = not state['all_axes']
+                    if state['all_axes']:
+                        self._follow()
+                    self._reanchor(context, event)
         except _SLIDE_ERRORS:
             self.report({'WARNING'}, 'The field changed during the slide; the original value was restored')
             self._restore()
@@ -1136,7 +1282,7 @@ def register():
         # returns PASS_THROUGH and native panning continues.
         for name in ('View2D Buttons List', 'View2D', 'Window'):
             keymap = keyconfig.keymaps.new(name=name, space_type='EMPTY')
-            item = keymap.keymap_items.new(VP_OT_slide.bl_idname, 'MIDDLEMOUSE', 'PRESS', head=True)
+            item = keymap.keymap_items.new(VP_OT_slide.bl_idname, 'MIDDLEMOUSE', 'PRESS', any=True, head=True)
             _KEYMAPS.append((keymap, item))
     except Exception:
         unregister()  # roll back whatever did register, then let the original error through
