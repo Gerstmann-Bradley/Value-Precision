@@ -62,7 +62,9 @@ So the process becomes:
 
 This implementation also opens a different workflow.
 1. if you already typed a value and start middle mouse scroll.
+
 <img width="354" height="165" alt="image" src="https://github.com/user-attachments/assets/b1adbbf4-843e-4498-af42-7ff0522ebd67" />
+
 2. it will apply the value first and then start scrolling at the same precision for fine tuning.
 
 # All Axes Support for Vectors
