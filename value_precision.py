@@ -804,6 +804,7 @@ class VP_OT_entry(Operator):
             'mouse': (event.mouse_x, event.mouse_y),
             'mode': state['mode'], 'shift': state['shift'],
             'all_axes': state['all_axes'], 'manual': state['manual'],
+            'card': state['card'],  # where the popup was drawn, so the slide panel can stay there
         }
         try:
             bpy.ops.value_precision.slide('INVOKE_DEFAULT')
@@ -1018,8 +1019,14 @@ def _draw_slide(state: dict) -> None:
     width = max(widths) + pad * 2
     heights = (small * 1.7, base * 1.7, big * 1.7, base * 1.6)  # bottom -> top
     height = sum(heights) + pad
-    left = min(max(state['mouse'][0] + 12 * scale, 2), max(2, region.width - width - 2))
-    bottom = min(max(state['mouse'][1] + 12 * scale, 2), max(2, region.height - height - 2))
+    if state['top_left'] is not None:
+        # Continuing from the typing popup: its title and value rows have the same heights as
+        # these, so keeping the top-left corner leaves them exactly where they were.
+        left, bottom = state['top_left'][0], state['top_left'][1] - height
+    else:
+        left, bottom = state['mouse'][0] + 12 * scale, state['mouse'][1] + 12 * scale
+    left = min(max(left, 2), max(2, region.width - width - 2))
+    bottom = min(max(bottom, 2), max(2, region.height - height - 2))
     radius = base * 1.6 * min(1.0, max(0.0, float(menu.roundness))) * .5
 
     gpu.state.blend_set('ALPHA')
@@ -1137,6 +1144,9 @@ class VP_OT_slide(Operator):
         self._state = {
             'region': region.as_pointer(),
             'mouse': (start_x - region.x, start_y - region.y),
+            # Started from the popup: keep its top-left corner so the panel does not jump.
+            'top_left': ((handoff['card'][0], handoff['card'][1] + handoff['card'][3])
+                         if handoff is not None and handoff.get('card') else None),
             'label': self._target.label,
             'shift': shift,                 # step exponent chosen by detection / keys
             'eff_shift': shift,             # exponent actually used (adds the Shift-held bonus)
