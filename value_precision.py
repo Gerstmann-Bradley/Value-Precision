@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 import blf
 import bpy
 import gpu
-from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences, Operator
 from gpu_extras.batch import batch_for_shader
 
@@ -49,6 +49,7 @@ _shader = None      # cached builtin shader; released in unregister()
 _last_choice: Optional[Tuple[str, int]] = None
 _last_slide_choice: Optional[Tuple[str, int]] = None  # same, for sliding
 _sliding = False    # True while a slide is in progress (prevents a second one starting)
+_handoff = None     # field and step passed from the typing popup to the slide it starts
 
 
 def key_name(identifier: str) -> str:
@@ -100,11 +101,16 @@ class VP_Preferences(AddonPreferences):
         name='Middle Mouse Sliding',
         description='Hold the middle mouse button over a number field and drag to change it in clean steps',
         default=True)
-    slide_alt: BoolProperty(
-        name='Require Alt to Slide',
-        description='Slide only with Alt + middle mouse, so plain middle mouse always pans. '
-                    'Alt only has to be held when you press the button, not during the drag',
-        default=False)
+    slide_trigger: EnumProperty(
+        name='Slide Trigger',
+        description='How a slide is started. Pressing the middle mouse button inside the typing popup '
+                    'always starts one, whichever you choose',
+        items=(('DIRECT', 'Middle Mouse over a Field',
+                'Hold the middle mouse button over a number field and drag'),
+               ('POPUP', 'From Popup Only',
+                'Open the typing popup first, then press the middle mouse button inside it. '
+                'Plain middle mouse over a field always pans')),
+        default='DIRECT')
     slide_offset: IntProperty(
         name='Slide Auto-detect Offset',
         description='Added to the number of decimals found in the current value to pick the slide step. '
@@ -139,7 +145,8 @@ class VP_Preferences(AddonPreferences):
         slide = layout.box()
         slide.label(text='Sliding (hold middle mouse over a field and drag)')
         slide.prop(self, 'slide_enabled')
-        slide.prop(self, 'slide_alt')
+        slide.prop(self, 'slide_trigger')
+        slide.label(text='Inside the typing popup, the middle mouse button switches to sliding with the chosen step.')
         slide.prop(self, 'slide_offset')
         slide.prop(self, 'slide_fine_offset')
         slide.prop(self, 'slide_whole_shift')
@@ -169,6 +176,12 @@ class VP_Preferences(AddonPreferences):
             keymap = keyconfig.keymaps.get('User Interface')
             item = next(k for k in keymap.keymap_items if k.idname == VP_OT_entry.bl_idname)
             rna_keymap_ui.draw_kmi([], keyconfig, keymap, item, layout, 0)
+            if item.active and item.type == 'MIDDLEMOUSE':
+                # The popup uses the middle mouse button to switch to sliding, so it cannot open with it.
+                warning = layout.box()
+                warning.alert = True
+                warning.label(text='The popup key is the middle mouse button, which switches the popup to '
+                                   'sliding. Please choose another key.', icon='ERROR')
         except (AttributeError, StopIteration, ImportError):
             pass  # keymap not available (e.g. background mode); the rest of the panel still works
 
@@ -551,7 +564,7 @@ def _draw(state: dict) -> None:
     hint_keys = (f"{state['coarser_name']} / {state['finer_name']}: exponent   "
                  f"{state['mode_name']}: ÷ ×   {state['sign_name']}: + −"
                  + (f"   {state['all_name']}: all" if state['multi'] else ''))
-    hint_actions = 'Space: apply   RMB: cancel'
+    hint_actions = 'Space: apply   MMB: slide   RMB: cancel'
     has_mode = not state['is_int']  # integer fields are always multiply
 
     # Layout: measure every row first so the card fits its widest text.
@@ -655,6 +668,11 @@ class VP_OT_entry(Operator):
         prop_tuple = getattr(context, 'property', None)
         if prop_tuple is None or context.space_data is None or context.region is None:
             return {'PASS_THROUGH'}
+        if event.type == 'MIDDLEMOUSE':
+            # Inside the popup this button switches to sliding, so it cannot also open the popup.
+            self.report({'WARNING'}, 'The popup key cannot be the middle mouse button. '
+                                     'Change it in the add-on preferences')
+            return {'PASS_THROUGH'}
         try:
             self._target = Target(context, prop_tuple)
             display = self._target.display()
@@ -719,6 +737,7 @@ class VP_OT_entry(Operator):
         }
         self._space = type(context.space_data)
         self._region_type = context.region.type
+        self._area, self._region = context.area, context.region  # handed to a slide started from here
         self._handle = self._space.draw_handler_add(_draw, (self._state,), self._region_type, 'POST_PIXEL')
         context.window_manager.modal_handler_add(self)
         context.region.tag_redraw()
@@ -763,15 +782,50 @@ class VP_OT_entry(Operator):
         self._state['manual'] = True
         context.region.tag_redraw()
 
+    def _to_slide(self, context, event):
+        """Middle mouse inside the popup: apply what was typed, then continue as a slide.
+
+        The slide starts from the field's new value with the exponent, divide / multiply and
+        all-axes settings shown in the popup. If nothing was typed the field is left untouched.
+        The typed value is its own undo step, and cancelling the slide returns to that value.
+        """
+        global _handoff
+        prefs = _prefs(context)
+        if prefs is not None and not prefs.slide_enabled:
+            return {'RUNNING_MODAL'}  # sliding is switched off: ignore the button
+        state = self._state
+        self._cleanup(context)  # closes the popup
+        typed = bool(state['digits'])
+        result = self._commit(context)  # applies the typed value, if any
+        if typed and 'FINISHED' not in result:
+            return result  # the write failed; do not start a slide on a field in an unknown state
+        _handoff = {
+            'target': self._target, 'area': self._area, 'region': self._region,
+            'mouse': (event.mouse_x, event.mouse_y),
+            'mode': state['mode'], 'shift': state['shift'],
+            'all_axes': state['all_axes'], 'manual': state['manual'],
+        }
+        try:
+            bpy.ops.value_precision.slide('INVOKE_DEFAULT')
+        except RuntimeError:
+            pass  # the slide could not start; the popup is closed
+        finally:
+            _handoff = None  # never leave a stale handoff behind
+        return {'FINISHED'} if typed else {'CANCELLED'}
+
     def _confirm(self, context):
-        """Apply the typed value. Returns the operator result set."""
+        """Close the popup and apply the typed value. Returns the operator result set."""
+        self._cleanup(context)
+        return self._commit(context)
+
+    def _commit(self, context):
+        """Write the typed value, if any, to the field. Returns the operator result set."""
         global _last_choice
         state = self._state
         # Remember a manual choice only when a value was actually typed with it.
         if state['manual'] and not state['is_int'] and state['digits']:
             _last_choice = (state['mode'], state['shift'])
         value = shifted_value(state['negative'], state['digits'], state['shift'], state['mode'])
-        self._cleanup(context)
         if value is None:
             return {'CANCELLED'}  # nothing typed: leave the field untouched
         try:
@@ -794,6 +848,10 @@ class VP_OT_entry(Operator):
         kind = event.type
         x, y = event.mouse_region_x, event.mouse_region_y
         moving = kind in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}
+
+        # 0. Middle mouse switches to sliding from the same field.
+        if kind == 'MIDDLEMOUSE' and event.value == 'PRESS':
+            return self._to_slide(context, event)
 
         # 1. Scrubbing the bar takes priority over everything else.
         if state['dragging']:
@@ -998,32 +1056,47 @@ class VP_OT_slide(Operator):
     bl_options = {'UNDO', 'INTERNAL'}  # one undo step, pushed only when the slide is committed
 
     def invoke(self, context, event):
-        global _sliding
+        global _sliding, _handoff
         window = context.window
-        if _sliding or window is None or event.type != 'MIDDLEMOUSE' or event.value != 'PRESS':
+        handoff, _handoff = _handoff, None  # always consumed, so a stale one never leaks into a later press
+        if _sliding or window is None:
             return {'PASS_THROUGH'}
         prefs = _prefs(context)
         if prefs is not None and not prefs.slide_enabled:
             return {'PASS_THROUGH'}
-        # The keymap item matches every modifier combination; the preference decides here.
-        # Ctrl and Shift always mean something else (zoom, pan), so they never start a slide.
-        # Alt is read only now, at the press: once the slide runs, it is not looked at again.
-        if event.ctrl or event.shift or event.alt != bool(prefs.slide_alt if prefs else False):
-            return {'PASS_THROUGH'}
-        area, region = _region_at(window, (event.mouse_x, event.mouse_y))
-        if area is None:
-            return {'PASS_THROUGH'}
-        try:
-            # The hovered button is only visible from inside its own region.
-            with context.temp_override(window=window, area=area, region=region):
-                if getattr(bpy.context, 'region_popup', None) is not None:
-                    return {'PASS_THROUGH'}
-                self._target = Target(bpy.context, getattr(bpy.context, 'property', None))
+
+        if handoff is not None:
+            # Started from the typing popup: the field, region and step are already known.
+            self._target = handoff['target']
+            area, region = handoff['area'], handoff['region']
+            start_x, start_y = handoff['mouse']
+            try:
                 display = self._target.display()
                 original_raw = self._target.raw()
                 original_all = self._target.raw_values()
-        except _SLIDE_ERRORS:
-            return {'PASS_THROUGH'}  # not a numeric field: native middle-mouse (panning) continues
+            except _SLIDE_ERRORS:
+                return {'PASS_THROUGH'}
+        else:
+            # Direct: plain middle mouse over a field, unless sliding is popup-only.
+            if event.type != 'MIDDLEMOUSE' or event.value != 'PRESS':
+                return {'PASS_THROUGH'}
+            if prefs is not None and prefs.slide_trigger != 'DIRECT':
+                return {'PASS_THROUGH'}
+            start_x, start_y = event.mouse_x, event.mouse_y
+            area, region = _region_at(window, (start_x, start_y))
+            if area is None:
+                return {'PASS_THROUGH'}
+            try:
+                # The hovered button is only visible from inside its own region.
+                with context.temp_override(window=window, area=area, region=region):
+                    if getattr(bpy.context, 'region_popup', None) is not None:
+                        return {'PASS_THROUGH'}
+                    self._target = Target(bpy.context, getattr(bpy.context, 'property', None))
+                    display = self._target.display()
+                    original_raw = self._target.raw()
+                    original_all = self._target.raw_values()
+            except _SLIDE_ERRORS:
+                return {'PASS_THROUGH'}  # not a numeric field: native middle-mouse (panning) continues
 
         offset = prefs.slide_offset if prefs else 0
         whole = prefs.slide_whole_shift if prefs else 0
@@ -1039,24 +1112,31 @@ class VP_OT_slide(Operator):
         pixels = prefs.pixels_per_step if prefs else 12.0
         self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
 
-        # Same starting-step logic as typing, with its own preferences and memory.
-        if self._target.is_int:
-            mode, shift = _MUL, 0
+        if handoff is not None:
+            # Carry over what the popup showed: exponent, divide / multiply and all-axes.
+            mode, shift = handoff['mode'], min(handoff['shift'], _MAX_SHIFT)
+            all_axes = bool(handoff['all_axes']) and self._target.multi
+            manual = bool(handoff['manual'])
         else:
-            mode, shift = _DIV, initial_shift(display, False, offset, whole)
-            if not count_decimals(display) and remember and _last_slide_choice is not None:
-                mode, shift = _last_slide_choice
+            # Same starting-step logic as typing, with its own preferences and memory.
+            all_axes = manual = False
+            if self._target.is_int:
+                mode, shift = _MUL, 0
+            else:
+                mode, shift = _DIV, initial_shift(display, False, offset, whole)
+                if not count_decimals(display) and remember and _last_slide_choice is not None:
+                    mode, shift = _last_slide_choice
 
         self._original_all = original_all           # every axis as it was (restored on cancel)
         self._expected_all = list(original_all)     # what we last wrote (for the re-apply timer)
         self._base = display                # value the current drag distance is measured from
         self._base_raw = original_raw       # the same value in stored units (exact)
         self._original_display = display            # hovered axis as it was, in display units
-        self._anchor_x = event.mouse_x      # where that measurement starts
+        self._anchor_x = start_x            # where that measurement starts
         self._ticks = 0
         self._state = {
             'region': region.as_pointer(),
-            'mouse': (event.mouse_x - region.x, event.mouse_y - region.y),
+            'mouse': (start_x - region.x, start_y - region.y),
             'label': self._target.label,
             'shift': shift,                 # step exponent chosen by detection / keys
             'eff_shift': shift,             # exponent actually used (adds the Shift-held bonus)
@@ -1064,13 +1144,13 @@ class VP_OT_slide(Operator):
             'fine_extra': prefs.slide_fine_offset if prefs else 1,
             'mode': mode,
             'is_int': self._target.is_int,
-            'manual': False,
+            'manual': manual,
             'value_text': '',
             'coarser_name': key_name(coarser),
             'finer_name': key_name(finer),
             'mode_name': key_name(mode_key),
             'multi': self._target.multi,    # hovered field is one axis of a vector
-            'all_axes': False,              # move every axis together
+            'all_axes': all_axes,           # move every axis together
             'all_name': key_name(all_key),
         }
         self._refresh_text()
@@ -1282,7 +1362,7 @@ def register():
         # returns PASS_THROUGH and native panning continues.
         for name in ('View2D Buttons List', 'View2D', 'Window'):
             keymap = keyconfig.keymaps.new(name=name, space_type='EMPTY')
-            item = keymap.keymap_items.new(VP_OT_slide.bl_idname, 'MIDDLEMOUSE', 'PRESS', any=True, head=True)
+            item = keymap.keymap_items.new(VP_OT_slide.bl_idname, 'MIDDLEMOUSE', 'PRESS', head=True)
             _KEYMAPS.append((keymap, item))
     except Exception:
         unregister()  # roll back whatever did register, then let the original error through
