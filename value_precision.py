@@ -62,7 +62,7 @@ def key_name(identifier: str) -> str:
 class VP_Preferences(AddonPreferences):
     """Addon preferences: auto-detection behaviour and the configurable keys."""
 
-    bl_idname = __name__
+    bl_idname = __package__
 
     offset: IntProperty(
         name='Auto-detect Offset',
@@ -165,7 +165,7 @@ class VP_Preferences(AddonPreferences):
 def _prefs(context) -> Optional[VP_Preferences]:
     """The addon's preferences, or None when it is not registered as an addon."""
     try:
-        return context.preferences.addons[__name__].preferences
+        return context.preferences.addons[__package__].preferences
     except KeyError:
         return None
 
@@ -1115,37 +1115,46 @@ class VP_OT_slide(Operator):
 # --------------------------------------------------------------------------- registration
 
 _CLASSES = (VP_Preferences, VP_OT_capture_key, VP_OT_entry, VP_OT_slide)
+_registered = []  # classes that really registered, so unregister never touches the others
 
 
 def register():
-    for cls in _CLASSES:
-        bpy.utils.register_class(cls)
-    keyconfig = bpy.context.window_manager.keyconfigs.addon
-    if keyconfig is None:  # background mode has no key configuration
-        return
-    # "User Interface" is consulted when the pointer is over a button, which is what makes
-    # context.property available to invoke(); the default trigger is the grave accent key (`).
-    keymap = keyconfig.keymaps.new('User Interface', space_type='EMPTY', region_type='WINDOW')
-    item = keymap.keymap_items.new(VP_OT_entry.bl_idname, 'ACCENT_GRAVE', 'PRESS')
-    _KEYMAPS.append((keymap, item))
-    # Middle mouse: View2D handles it first for panning (sidebars, Properties, node editor), so
-    # the slide entry goes to the head of those keymaps. Anything that is not a numeric field
-    # returns PASS_THROUGH and native panning continues.
-    for name in ('View2D Buttons List', 'View2D', 'Window'):
-        keymap = keyconfig.keymaps.new(name=name, space_type='EMPTY')
-        item = keymap.keymap_items.new(VP_OT_slide.bl_idname, 'MIDDLEMOUSE', 'PRESS', head=True)
+    try:
+        for cls in _CLASSES:
+            bpy.utils.register_class(cls)
+            _registered.append(cls)
+        keyconfig = bpy.context.window_manager.keyconfigs.addon
+        if keyconfig is None:  # background mode has no key configuration
+            return
+        # "User Interface" is consulted when the pointer is over a button, which is what makes
+        # context.property available to invoke(); the default trigger is the grave accent key (`).
+        keymap = keyconfig.keymaps.new('User Interface', space_type='EMPTY', region_type='WINDOW')
+        item = keymap.keymap_items.new(VP_OT_entry.bl_idname, 'ACCENT_GRAVE', 'PRESS')
         _KEYMAPS.append((keymap, item))
+        # Middle mouse: View2D handles it first for panning (sidebars, Properties, node editor), so
+        # the slide entry goes to the head of those keymaps. Anything that is not a numeric field
+        # returns PASS_THROUGH and native panning continues.
+        for name in ('View2D Buttons List', 'View2D', 'Window'):
+            keymap = keyconfig.keymaps.new(name=name, space_type='EMPTY')
+            item = keymap.keymap_items.new(VP_OT_slide.bl_idname, 'MIDDLEMOUSE', 'PRESS', head=True)
+            _KEYMAPS.append((keymap, item))
+    except Exception:
+        unregister()  # roll back whatever did register, then let the original error through
+        raise
 
 
 def unregister():
     global _shader
     for keymap, item in _KEYMAPS:
-        keymap.keymap_items.remove(item)
+        try:
+            keymap.keymap_items.remove(item)
+        except (RuntimeError, ReferenceError):
+            pass  # already gone, e.g. the key configuration was reloaded
     _KEYMAPS.clear()
-    for cls in reversed(_CLASSES):
-        bpy.utils.unregister_class(cls)
+    for cls in reversed(_registered):
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass  # not registered any more
+    _registered.clear()
     _shader = None  # drop the cached GPU shader wrapper
-
-
-if __name__ == '__main__':
-    register()
