@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Value Precision",
     "author": "Bradley Animation",
-    "version": (0, 5, 0),
+    "version": (0, 7, 0),
     "blender": (4, 2, 0),
     "location": "Hover a number field: press ` to type, hold middle mouse to slide",
     "description": "Type digits for exact decimals, slide values in clean steps.",
@@ -10,6 +10,7 @@ bl_info = {
 
 import math
 import re
+import struct
 from decimal import Decimal
 from typing import Optional, Tuple
 
@@ -19,6 +20,11 @@ import gpu
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import AddonPreferences, Operator
 from gpu_extras.batch import batch_for_shader
+
+try:
+    from . import socket_limits  # declared ranges of built-in node inputs (generated, see tools/)
+except ImportError:  # not running as part of the package
+    socket_limits = None
 
 # --------------------------------------------------------------------------- constants
 
@@ -111,6 +117,17 @@ class VP_Preferences(AddonPreferences):
                 'Open the typing popup first, then press the middle mouse button inside it. '
                 'Plain middle mouse over a field always pans')),
         default='DIRECT')
+    slide_freeze_cursor: BoolProperty(
+        name='Freeze Cursor While Sliding',
+        description='Hide the cursor and keep it in place while sliding, like Blender\'s own number fields, '
+                    'so the drag is never stopped by the edge of the screen. Turn this off if your system '
+                    'cannot move the cursor (some Linux setups)',
+        default=True)
+    soft_limits: BoolProperty(
+        name='Respect Soft Limits',
+        description='Sliding stops at the soft limits of a field, like the native sliders. Typing is not '
+                    'affected, and hard limits are always enforced by Blender',
+        default=True)
     slide_offset: IntProperty(
         name='Slide Auto-detect Offset',
         description='Added to the number of decimals found in the current value to pick the slide step. '
@@ -147,11 +164,13 @@ class VP_Preferences(AddonPreferences):
         slide.prop(self, 'slide_enabled')
         slide.prop(self, 'slide_trigger')
         slide.label(text='Inside the typing popup, the middle mouse button switches to sliding with the chosen step.')
+        slide.prop(self, 'soft_limits')
         slide.prop(self, 'slide_offset')
         slide.prop(self, 'slide_fine_offset')
         slide.prop(self, 'slide_whole_shift')
         slide.prop(self, 'slide_remember_last')
         slide.prop(self, 'pixels_per_step')
+        slide.prop(self, 'slide_freeze_cursor')
         slide.label(text='Middle mouse is bound in the "View2D", "View2D Buttons List" and "Window" keymaps.')
 
         box = layout.box()
@@ -237,10 +256,30 @@ class VP_OT_capture_key(Operator):
 
 # --------------------------------------------------------------------------- value helpers
 
+def _float32(value: float) -> float:
+    """The nearest 32-bit float, which is how Blender stores most numbers."""
+    return struct.unpack('<f', struct.pack('<f', value))[0]
+
+
 def count_decimals(value: float) -> int:
-    """Number of visible decimals, ignoring float noise (0.05000000074 -> 2)."""
-    text = f'{abs(value):.6f}'.rstrip('0')
-    return len(text.partition('.')[2])
+    """Number of decimals the value was meant to have (0.05 -> 2, 33.6 -> 1, 90.0000025 -> 0).
+
+    Blender stores most numbers as 32-bit floats, which keep only about seven significant
+    digits: 33.6 is stored as 33.599998474..., so counting digits directly would find six
+    decimals. Instead this looks for the fewest decimals that give back the very same stored
+    number. Values that round to zero at six decimals count as 0, like a whole number.
+    """
+    value = abs(float(value))
+    if not math.isfinite(value) or round(value, 6) == 0:
+        return 0
+    try:
+        stored = _float32(value)
+        for decimals in range(7):
+            if _float32(round(value, decimals)) == stored:
+                return decimals
+    except OverflowError:  # larger than a 32-bit float can hold: fall back to plain digits
+        pass
+    return len(f'{value:.6f}'.rstrip('0').partition('.')[2])
 
 
 def initial_shift(display_value: float, is_int: bool, offset: int, whole_shift: int,
@@ -343,6 +382,7 @@ class Target:
             except (AttributeError, TypeError, ReferenceError):
                 pass
         self.label = self._label(prop)
+        self.soft = self._soft_limits(prop)
 
     def _label(self, prop) -> str:
         """A name worth showing: the socket / input name rather than 'default_value'.
@@ -371,6 +411,79 @@ class Target:
         except (AttributeError, ReferenceError, RuntimeError):
             return self.name.replace('_', ' ').title()
 
+    def _socket_limits(self):
+        """Range of a node socket's value as (low, high), or None when it is not known.
+
+        Blender keeps the range of a socket internally and does not expose it to Python, so it
+        comes from three places:
+
+        * a group node (a custom node): the limits set on the group's interface socket, which
+          Python can read;
+        * an interface socket being edited in the sidebar: its own min / max;
+        * a built-in node: the table generated from Blender itself (socket_limits.py). An input
+          of a node that the table knows about, but that is not listed, has no limit.
+
+        Anything else falls back to the range of the socket's type.
+        """
+        socket = self.pointer
+        if hasattr(socket, 'min_value') and hasattr(socket, 'max_value'):
+            return socket.min_value, socket.max_value  # an interface item's default value
+        node = getattr(socket, 'node', None)
+        if node is None:
+            return None
+        tree = getattr(node, 'node_tree', None)
+        if tree is not None:  # group node
+            for item in tree.interface.items_tree:
+                if (item.item_type == 'SOCKET' and item.identifier == socket.identifier
+                        and getattr(item, 'in_out', 'INPUT') in {'INPUT', 'BOTH'}):
+                    return getattr(item, 'min_value', None), getattr(item, 'max_value', None)
+            return None
+        if socket_limits is not None and node.bl_idname in socket_limits.SCANNED:
+            return socket_limits.LIMITS.get(node.bl_idname, {}).get(socket.identifier, (None, None))
+        return None  # a node newer than the table: unknown
+
+    def _soft_limits(self, prop) -> tuple:
+        """(low, high) the native sliders stop at, in stored units; None means no limit.
+
+        Sources: the UI settings of a custom property (Geometry Nodes inputs); the range of a
+        node socket (see _socket_limits); otherwise the property's own soft range.
+        """
+        huge = 1e9  # Blender's "no limit" is +-FLT_MAX (floats) or INT_MIN / INT_MAX (ints)
+        low = high = None
+        try:
+            if self.custom:
+                ui = self.pointer.id_properties_ui(self.name).as_dict()
+                low, high = ui.get('soft_min', ui.get('min')), ui.get('soft_max', ui.get('max'))
+            else:
+                low, high = prop.soft_min, prop.soft_max
+                socket_type = getattr(bpy.types, 'NodeSocket', None)
+                is_socket = socket_type is not None and isinstance(self.pointer, socket_type)
+                if self.name == 'default_value' and (is_socket or hasattr(self.pointer, 'min_value')):
+                    declared = self._socket_limits()
+                    if declared is not None:
+                        low, high = declared
+                    elif (low, high) in {(-10000.0, 10000.0), (-10000, 10000)}:
+                        low = high = None  # the generic range every plain socket reports, not a real limit
+            low = None if low is None or abs(low) >= huge else low
+            high = None if high is None or abs(high) >= huge else high
+        except (AttributeError, KeyError, TypeError, ValueError, ReferenceError, RuntimeError):
+            return (None, None)
+        return (low, high)
+
+    def soft_clamp(self, raw_value: float, start_raw: float) -> float:
+        """Keep a slid value inside the soft limits.
+
+        The range is widened to include ``start_raw``: a value that already sits outside the
+        limits (typed there) is not pulled back, but cannot move further out, and moving back
+        in works straight away.
+        """
+        low, high = self.soft
+        if low is not None:
+            raw_value = max(raw_value, min(low, start_raw))
+        if high is not None:
+            raw_value = min(raw_value, max(high, start_raw))
+        return raw_value
+
     def raw(self) -> float:
         """Stored value (radians for rotations)."""
         value = self.pointer[self.name] if self.custom else getattr(self.pointer, self.name)
@@ -381,9 +494,14 @@ class Target:
         value = self.raw()
         return math.degrees(value) if self.rotation else value
 
-    def write(self, display_value: float) -> None:
-        """Store a value given in display units (degrees for rotations)."""
+    def write(self, display_value: float, start_raw=None) -> None:
+        """Store a value given in display units (degrees for rotations).
+
+        With ``start_raw`` the value is kept inside the soft limits first (sliding only).
+        """
         value = math.radians(display_value) if self.rotation else display_value
+        if start_raw is not None:
+            value = self.soft_clamp(value, start_raw)
         if self.is_int:
             value = int(round(value))
         if self.array:
@@ -563,7 +681,7 @@ def _draw(state: dict) -> None:
     # Coarser key first, finer key second: left to right matches the direction of the bar.
     hint_keys = (f"{state['coarser_name']} / {state['finer_name']}: exponent   "
                  f"{state['mode_name']}: ÷ ×   {state['sign_name']}: + −"
-                 + (f"   {state['all_name']}: all" if state['multi'] else ''))
+                 + (f"   {state['all_name']}: all axes" if state['multi'] else ''))
     hint_actions = 'Space: apply   MMB: slide   RMB: cancel'
     has_mode = not state['is_int']  # integer fields are always multiply
 
@@ -1118,6 +1236,7 @@ class VP_OT_slide(Operator):
         self._all_key = all_key
         pixels = prefs.pixels_per_step if prefs else 12.0
         self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
+        self._soft_on = bool(prefs.soft_limits) if prefs else True
 
         if handoff is not None:
             # Carry over what the popup showed: exponent, divide / multiply and all-axes.
@@ -1139,7 +1258,11 @@ class VP_OT_slide(Operator):
         self._base = display                # value the current drag distance is measured from
         self._base_raw = original_raw       # the same value in stored units (exact)
         self._original_display = display            # hovered axis as it was, in display units
-        self._anchor_x = start_x            # where that measurement starts
+        self._window = window
+        self._freeze = bool(prefs.slide_freeze_cursor) if prefs else True
+        self._center = (start_x, start_y)   # where the cursor is held while it is frozen
+        self._virtual_x = float(start_x)    # horizontal position as if the cursor could move freely
+        self._anchor_x = self._virtual_x    # where the current measurement starts
         self._ticks = 0
         self._state = {
             'region': region.as_pointer(),
@@ -1171,6 +1294,8 @@ class VP_OT_slide(Operator):
         self._timer = context.window_manager.event_timer_add(.1, window=window)
         _sliding = True
         context.window_manager.modal_handler_add(self)
+        if self._freeze:
+            window.cursor_modal_set('NONE')  # hidden and held in place, like a native number field
         region.tag_redraw()
         return {'RUNNING_MODAL'}
 
@@ -1198,6 +1323,13 @@ class VP_OT_slide(Operator):
         if timer is not None:
             context.window_manager.event_timer_remove(timer)
             self._timer = None
+        if getattr(self, '_freeze', False):
+            self._freeze = False
+            try:
+                self._window.cursor_warp(*self._center)  # the cursor reappears where the slide began
+                self._window.cursor_modal_restore()
+            except (RuntimeError, ReferenceError, AttributeError):
+                pass
         for area in context.screen.areas if context.screen else ():
             area.tag_redraw()
 
@@ -1229,7 +1361,7 @@ class VP_OT_slide(Operator):
         self._base = self._target.display()
         self._base_raw = self._target.raw()
         self._expected_all = self._target.raw_values()
-        self._anchor_x = event.mouse_x
+        self._anchor_x = self._virtual_x
         self._ticks = 0
         self._refresh_text()
         self._redraw(context)
@@ -1256,32 +1388,65 @@ class VP_OT_slide(Operator):
         target = self._target
         delta = target.display() - self._original_display
         current = target.raw_values()
+
+        def limited(axis, raw):  # every axis stops at its own soft limits
+            return target.soft_clamp(raw, self._original_all[axis]) if self._soft_on else raw
+
         target.write_raw_values([
-            current[axis] if axis == target.index else target.to_raw(target.to_display(raw) + delta)
+            current[axis] if axis == target.index else limited(axis, target.to_raw(target.to_display(raw) + delta))
             for axis, raw in enumerate(self._original_all)])
 
-    def _write_drag(self, value) -> None:
-        """Write one drag result: ``value`` is the hovered axis in display units, None = back at the anchor."""
+    def _write_drag(self, value) -> bool:
+        """Write one drag result: ``value`` is the hovered axis in display units, None = back at the anchor.
+
+        Returns True when a soft limit stopped the hovered axis.
+        """
         target = self._target
+        clamped = False
         if value is None:
             target.write_raw(self._base_raw)    # back at the anchor: exactly as it was
         else:
-            target.write(value)
+            start = self._original_all[target.index]
+            if self._soft_on:
+                raw = target.to_raw(value)
+                clamped = target.soft_clamp(raw, start) != raw
+            target.write(value, start_raw=start if self._soft_on else None)
         if self._state['all_axes'] and target.multi:
             self._follow()
+        return clamped
+
+    def _track_mouse(self, event) -> None:
+        """Update the virtual horizontal position from a mouse move.
+
+        With the cursor frozen, every move is measured from the point where the slide began and
+        the cursor is put back there, so the drag can go on forever. Putting it back causes one
+        more move event at that point, which adds nothing. Without freezing, the real position
+        is used and the drag stops at the edge of the screen.
+        """
+        if not self._freeze:
+            self._virtual_x = float(event.mouse_x)
+            return
+        center_x, center_y = self._center
+        moved_x, moved_y = event.mouse_x - center_x, event.mouse_y - center_y
+        if moved_x or moved_y:
+            self._virtual_x += moved_x
+            self._window.cursor_warp(center_x, center_y)
 
     def _apply_drag(self, context, event) -> None:
         """Write the value for the current horizontal distance (whole steps only)."""
-        ticks = math.trunc((event.mouse_x - self._anchor_x) / self._pixels)
+        ticks = math.trunc((self._virtual_x - self._anchor_x) / self._pixels)
         if ticks == self._ticks:
             return
         self._ticks = ticks
         step = step_size(self._state['eff_shift'], self._state['mode'])
         value = slide_value(self._base, step, ticks)
-        self._write_drag(value)
+        clamped = self._write_drag(value)
         self._expected_all = self._target.raw_values()  # read back: includes clamping / float32
         self._refresh_text()
         self._redraw(context)
+        if clamped:
+            # Stopped at a soft limit: measure from here, so reversing moves the value straight away.
+            self._reanchor(context, event)
 
     @staticmethod
     def _redraw(context) -> None:
@@ -1322,6 +1487,7 @@ class VP_OT_slide(Operator):
                 self._reanchor(context, event)
 
             if kind in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
+                self._track_mouse(event)
                 self._apply_drag(context, event)
             elif kind == 'TIMER':
                 if self._target.raw_values() != self._expected_all:
