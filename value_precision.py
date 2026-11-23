@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Value Precision",
     "author": "Bradley Animation",
-    "version": (0, 7, 0),
+    "version": (0, 8, 0),
     "blender": (4, 2, 0),
     "location": "Hover a number field: press ` to type, hold middle mouse to slide",
     "description": "Type digits for exact decimals, slide values in clean steps.",
@@ -12,12 +12,12 @@ import math
 import re
 import struct
 from decimal import Decimal
-from typing import Optional, Tuple
+from typing import Optional
 
 import blf
 import bpy
 import gpu
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy.types import AddonPreferences, Operator
 from gpu_extras.batch import batch_for_shader
 
@@ -49,11 +49,9 @@ _MAX_SHIFT = 9      # highest power of ten (used by sliding, which has no bar)
 _TYPE_MAX_SHIFT = 5  # highest exponent on the typing popup's bar
 _MAX_DIGITS = 12    # cap on typed digits
 _DIV, _MUL = 'DIV', 'MUL'
+_FINE_EXTRA = 1    # decimals finer the slide step gets while Shift is held
 _KEYMAPS = []       # (keymap, item) pairs added at register time, removed on unregister
 _shader = None      # cached builtin shader; released in unregister()
-# Last (mode, shift) chosen by hand this session; reused for whole-number fields (remember_last).
-_last_choice: Optional[Tuple[str, int]] = None
-_last_slide_choice: Optional[Tuple[str, int]] = None  # same, for sliding
 _sliding = False    # True while a slide is in progress (prevents a second one starting)
 _handoff = None     # field and step passed from the typing popup to the slide it starts
 
@@ -67,24 +65,10 @@ def key_name(identifier: str) -> str:
 # --------------------------------------------------------------------------- preferences
 
 class VP_Preferences(AddonPreferences):
-    """Addon preferences: auto-detection behaviour and the configurable keys."""
+    """Add-on preferences: the sliding trigger, the drag distance and the configurable keys."""
 
     bl_idname = __package__
 
-    offset: IntProperty(
-        name='Auto-detect Offset',
-        description='Added to the number of decimals found in the current value. '
-                    '0 keeps the same precision (0.05 -> 10^2), 1 goes one step finer (0.05 -> 10^3)',
-        default=0, min=-3, max=6)
-    whole_shift: IntProperty(
-        name='Exponent for Whole Numbers',
-        description='Starting ÷ 10^n when the current value has no decimals (0, 1, 10, 100 ...)',
-        default=0, min=0, max=_MAX_SHIFT)
-    remember_last: BoolProperty(
-        name='Remember Last Choice for Whole Numbers',
-        description='When a field has no decimals (for example 0), start from the mode (÷ or ×) and exponent '
-                    'you last chose by hand instead of the fixed whole-number exponent',
-        default=False)
     click_passthrough: BoolProperty(
         name='Click Also Acts Normally',
         description='A confirming mouse click is also passed on, so it can start the next field right away',
@@ -98,11 +82,6 @@ class VP_Preferences(AddonPreferences):
         name='All Axes Key',
         description='Toggle applying the change to every axis of a vector, while typing or sliding',
         default='A')
-    auto_sign: BoolProperty(
-        name='Detect Sign',
-        description='Start typing with the sign of the current value, so a negative field gives a negative result',
-        default=True)
-
     slide_enabled: BoolProperty(
         name='Middle Mouse Sliding',
         description='Hold the middle mouse button over a number field and drag to change it in clean steps',
@@ -117,35 +96,6 @@ class VP_Preferences(AddonPreferences):
                 'Open the typing popup first, then press the middle mouse button inside it. '
                 'Plain middle mouse over a field always pans')),
         default='DIRECT')
-    slide_freeze_cursor: BoolProperty(
-        name='Freeze Cursor While Sliding',
-        description='Hide the cursor and keep it in place while sliding, like Blender\'s own number fields, '
-                    'so the drag is never stopped by the edge of the screen. Turn this off if your system '
-                    'cannot move the cursor (some Linux setups)',
-        default=True)
-    soft_limits: BoolProperty(
-        name='Respect Soft Limits',
-        description='Sliding stops at the soft limits of a field, like the native sliders. Typing is not '
-                    'affected, and hard limits are always enforced by Blender',
-        default=True)
-    slide_offset: IntProperty(
-        name='Slide Auto-detect Offset',
-        description='Added to the number of decimals found in the current value to pick the slide step. '
-                    '0 keeps the same precision (0.05 slides by 0.01). Anything above 0 adds a decimal '
-                    'every time you slide again; hold Shift while sliding for a finer step instead',
-        default=0, min=-3, max=6)
-    slide_fine_offset: IntProperty(
-        name='Extra Decimals While Holding Shift',
-        description='How many decimals finer the slide step gets while Shift is held',
-        default=1, min=1, max=4)
-    slide_whole_shift: IntProperty(
-        name='Slide Exponent for Whole Numbers',
-        description='Starting step 10^-n when the current value has no decimals (0, 1, 10, 100 ...)',
-        default=0, min=0, max=_MAX_SHIFT)
-    slide_remember_last: BoolProperty(
-        name='Remember Last Slide Step for Whole Numbers',
-        description='When a field has no decimals, start sliding with the mode and exponent you last chose by hand',
-        default=False)
     pixels_per_step: FloatProperty(
         name='Pixels per Step',
         description='Horizontal drag distance, in UI pixels, for one step',
@@ -153,10 +103,6 @@ class VP_Preferences(AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, 'offset')
-        layout.prop(self, 'whole_shift')
-        layout.prop(self, 'remember_last')
-        layout.prop(self, 'auto_sign')
         layout.prop(self, 'click_passthrough')
 
         slide = layout.box()
@@ -164,13 +110,7 @@ class VP_Preferences(AddonPreferences):
         slide.prop(self, 'slide_enabled')
         slide.prop(self, 'slide_trigger')
         slide.label(text='Inside the typing popup, the middle mouse button switches to sliding with the chosen step.')
-        slide.prop(self, 'soft_limits')
-        slide.prop(self, 'slide_offset')
-        slide.prop(self, 'slide_fine_offset')
-        slide.prop(self, 'slide_whole_shift')
-        slide.prop(self, 'slide_remember_last')
         slide.prop(self, 'pixels_per_step')
-        slide.prop(self, 'slide_freeze_cursor')
         slide.label(text='Middle mouse is bound in the "View2D", "View2D Buttons List" and "Window" keymaps.')
 
         box = layout.box()
@@ -282,18 +222,16 @@ def count_decimals(value: float) -> int:
     return len(f'{value:.6f}'.rstrip('0').partition('.')[2])
 
 
-def initial_shift(display_value: float, is_int: bool, offset: int, whole_shift: int,
-                  limit: int = _MAX_SHIFT) -> int:
+def initial_shift(display_value: float, is_int: bool, limit: int = _MAX_SHIFT) -> int:
     """Auto-detected starting exponent (for ÷) of a field currently showing ``display_value``.
 
-    Fields with decimals: decimals + offset. Fields without (0, 1, 10 ...): ``whole_shift``.
-    Integer fields always use 0 (they start in multiply mode, see ``invoke``).
+    It is the number of decimals the value has (0.05 -> 2), so typing 3 gives 0.03. Fields
+    without decimals (0, 1, 10 ...) start at 0. Integer fields always use 0 (they start in
+    multiply mode, see ``invoke``).
     """
     if is_int:
         return 0
-    decimals = count_decimals(display_value)
-    shift = decimals + offset if decimals else whole_shift
-    return max(0, min(limit, shift))
+    return min(limit, count_decimals(display_value))
 
 
 def _scaled(negative: bool, digits: str, shift: int, mode: str) -> Decimal:
@@ -798,9 +736,6 @@ class VP_OT_entry(Operator):
             return {'PASS_THROUGH'}
 
         prefs = _prefs(context)
-        offset = prefs.offset if prefs else 0
-        whole = prefs.whole_shift if prefs else 0
-        remember = prefs.remember_last if prefs else True
         self._passthrough = prefs.click_passthrough if prefs else True
         self._trigger = event.type  # pressing the same key again confirms (unless it has another job)
         coarser = prefs.coarser_key if prefs else 'Z'
@@ -814,18 +749,14 @@ class VP_OT_entry(Operator):
         all_key = prefs.all_key if prefs else 'A'
         self._all_key = all_key
         # The result takes the sign of the current value (zero counts as positive).
-        negative = bool(prefs.auto_sign if prefs else True) and display < 0
+        negative = display < 0
 
         # Starting mode and exponent. Integers start in multiply mode (dividing them is
-        # pointless); floats with decimals are auto-detected; whole-number floats may reuse the
-        # last manual choice.
+        # pointless); floats start in divide mode with the exponent detected from the value.
         if self._target.is_int:
             mode, shift = _MUL, 0
         else:
-            mode, shift = _DIV, initial_shift(display, False, offset, whole, _TYPE_MAX_SHIFT)
-            if not count_decimals(display) and remember and _last_choice is not None:
-                mode, shift = _last_choice
-                shift = min(shift, _TYPE_MAX_SHIFT)
+            mode, shift = _DIV, initial_shift(display, False, _TYPE_MAX_SHIFT)
 
         # Everything the draw callback and modal need lives in a plain dict, so the draw
         # handler never holds a reference to the operator instance.
@@ -839,7 +770,6 @@ class VP_OT_entry(Operator):
             'digits': '',
             'negative': negative,
             'sign_rects': None,    # ((+ rect), (− rect)), set by _draw
-            'manual': False,       # True once the user changed mode or exponent by hand
             'dragging': False,     # True while the mouse is scrubbing the bar
             'slider': None,        # (left, bottom, width, height) of the bar, set by _draw
             'mode_rects': None,    # ((÷ rect), (× rect)), set by _draw
@@ -887,9 +817,8 @@ class VP_OT_entry(Operator):
         return max(0, min(_TYPE_MAX_SHIFT, int((x - left) / (width / (_TYPE_MAX_SHIFT + 1)))))
 
     def _set_shift(self, context, value: int) -> None:
-        """Change the exponent by hand and remember that it was a manual override."""
+        """Change the exponent."""
         self._state['shift'] = value
-        self._state['manual'] = True
         context.region.tag_redraw()
 
     def _set_mode(self, context, mode: str) -> None:
@@ -897,7 +826,6 @@ class VP_OT_entry(Operator):
         if self._state['is_int']:
             return
         self._state['mode'] = mode
-        self._state['manual'] = True
         context.region.tag_redraw()
 
     def _to_slide(self, context, event):
@@ -921,7 +849,7 @@ class VP_OT_entry(Operator):
             'target': self._target, 'area': self._area, 'region': self._region,
             'mouse': (event.mouse_x, event.mouse_y),
             'mode': state['mode'], 'shift': state['shift'],
-            'all_axes': state['all_axes'], 'manual': state['manual'],
+            'all_axes': state['all_axes'],
             'card': state['card'],  # where the popup was drawn, so the slide panel can stay there
         }
         try:
@@ -939,11 +867,7 @@ class VP_OT_entry(Operator):
 
     def _commit(self, context):
         """Write the typed value, if any, to the field. Returns the operator result set."""
-        global _last_choice
         state = self._state
-        # Remember a manual choice only when a value was actually typed with it.
-        if state['manual'] and not state['is_int'] and state['digits']:
-            _last_choice = (state['mode'], state['shift'])
         value = shifted_value(state['negative'], state['digits'], state['shift'], state['mode'])
         if value is None:
             return {'CANCELLED'}  # nothing typed: leave the field untouched
@@ -1223,9 +1147,6 @@ class VP_OT_slide(Operator):
             except _SLIDE_ERRORS:
                 return {'PASS_THROUGH'}  # not a numeric field: native middle-mouse (panning) continues
 
-        offset = prefs.slide_offset if prefs else 0
-        whole = prefs.slide_whole_shift if prefs else 0
-        remember = prefs.slide_remember_last if prefs else True
         coarser = prefs.coarser_key if prefs else 'Z'
         finer = prefs.finer_key if prefs else 'X'
         mode_key = prefs.mode_key if prefs else 'C'
@@ -1236,22 +1157,18 @@ class VP_OT_slide(Operator):
         self._all_key = all_key
         pixels = prefs.pixels_per_step if prefs else 12.0
         self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
-        self._soft_on = bool(prefs.soft_limits) if prefs else True
 
         if handoff is not None:
             # Carry over what the popup showed: exponent, divide / multiply and all-axes.
             mode, shift = handoff['mode'], min(handoff['shift'], _MAX_SHIFT)
             all_axes = bool(handoff['all_axes']) and self._target.multi
-            manual = bool(handoff['manual'])
         else:
-            # Same starting-step logic as typing, with its own preferences and memory.
-            all_axes = manual = False
+            # Same starting-step logic as typing.
+            all_axes = False
             if self._target.is_int:
                 mode, shift = _MUL, 0
             else:
-                mode, shift = _DIV, initial_shift(display, False, offset, whole)
-                if not count_decimals(display) and remember and _last_slide_choice is not None:
-                    mode, shift = _last_slide_choice
+                mode, shift = _DIV, initial_shift(display, False)
 
         self._original_all = original_all           # every axis as it was (restored on cancel)
         self._expected_all = list(original_all)     # what we last wrote (for the re-apply timer)
@@ -1259,7 +1176,7 @@ class VP_OT_slide(Operator):
         self._base_raw = original_raw       # the same value in stored units (exact)
         self._original_display = display            # hovered axis as it was, in display units
         self._window = window
-        self._freeze = bool(prefs.slide_freeze_cursor) if prefs else True
+        self._frozen = False                # True while the cursor is hidden and held
         self._center = (start_x, start_y)   # where the cursor is held while it is frozen
         self._virtual_x = float(start_x)    # horizontal position as if the cursor could move freely
         self._anchor_x = self._virtual_x    # where the current measurement starts
@@ -1274,10 +1191,8 @@ class VP_OT_slide(Operator):
             'shift': shift,                 # step exponent chosen by detection / keys
             'eff_shift': shift,             # exponent actually used (adds the Shift-held bonus)
             'fine': False,                  # True while Shift is held
-            'fine_extra': prefs.slide_fine_offset if prefs else 1,
             'mode': mode,
             'is_int': self._target.is_int,
-            'manual': manual,
             'value_text': '',
             'coarser_name': key_name(coarser),
             'finer_name': key_name(finer),
@@ -1294,8 +1209,8 @@ class VP_OT_slide(Operator):
         self._timer = context.window_manager.event_timer_add(.1, window=window)
         _sliding = True
         context.window_manager.modal_handler_add(self)
-        if self._freeze:
-            window.cursor_modal_set('NONE')  # hidden and held in place, like a native number field
+        window.cursor_modal_set('NONE')  # hidden and held in place, like a native number field
+        self._frozen = True
         region.tag_redraw()
         return {'RUNNING_MODAL'}
 
@@ -1323,8 +1238,8 @@ class VP_OT_slide(Operator):
         if timer is not None:
             context.window_manager.event_timer_remove(timer)
             self._timer = None
-        if getattr(self, '_freeze', False):
-            self._freeze = False
+        if getattr(self, '_frozen', False):
+            self._frozen = False
             try:
                 self._window.cursor_warp(*self._center)  # the cursor reappears where the slide began
                 self._window.cursor_modal_restore()
@@ -1351,7 +1266,7 @@ class VP_OT_slide(Operator):
         The bonus is temporary and never stored, so it cannot accumulate between slides.
         """
         state = self._state
-        extra = state['fine_extra'] if state['fine'] and not state['is_int'] else 0
+        extra = _FINE_EXTRA if state['fine'] and not state['is_int'] else 0
         # Finer means a smaller step: a bigger exponent when dividing, a smaller one when multiplying.
         shift = state['shift'] + extra if state['mode'] == _DIV else state['shift'] - extra
         state['eff_shift'] = max(0, min(_MAX_SHIFT, shift))
@@ -1373,7 +1288,6 @@ class VP_OT_slide(Operator):
             state['mode'] = mode
         if shift is not None:
             state['shift'] = shift
-        state['manual'] = True
         self._update_effective()
         self._reanchor(context, event)
 
@@ -1390,7 +1304,7 @@ class VP_OT_slide(Operator):
         current = target.raw_values()
 
         def limited(axis, raw):  # every axis stops at its own soft limits
-            return target.soft_clamp(raw, self._original_all[axis]) if self._soft_on else raw
+            return target.soft_clamp(raw, self._original_all[axis])
 
         target.write_raw_values([
             current[axis] if axis == target.index else limited(axis, target.to_raw(target.to_display(raw) + delta))
@@ -1407,10 +1321,9 @@ class VP_OT_slide(Operator):
             target.write_raw(self._base_raw)    # back at the anchor: exactly as it was
         else:
             start = self._original_all[target.index]
-            if self._soft_on:
-                raw = target.to_raw(value)
-                clamped = target.soft_clamp(raw, start) != raw
-            target.write(value, start_raw=start if self._soft_on else None)
+            raw = target.to_raw(value)
+            clamped = target.soft_clamp(raw, start) != raw  # stopped at a soft limit
+            target.write(value, start_raw=start)
         if self._state['all_axes'] and target.multi:
             self._follow()
         return clamped
@@ -1418,14 +1331,10 @@ class VP_OT_slide(Operator):
     def _track_mouse(self, event) -> None:
         """Update the virtual horizontal position from a mouse move.
 
-        With the cursor frozen, every move is measured from the point where the slide began and
-        the cursor is put back there, so the drag can go on forever. Putting it back causes one
-        more move event at that point, which adds nothing. Without freezing, the real position
-        is used and the drag stops at the edge of the screen.
+        The cursor is frozen: every move is measured from the point where the slide began and the
+        cursor is put back there, so the drag can go on forever. Putting it back causes one more
+        move event at that point, which adds nothing.
         """
-        if not self._freeze:
-            self._virtual_x = float(event.mouse_x)
-            return
         center_x, center_y = self._center
         moved_x, moved_y = event.mouse_x - center_x, event.mouse_y - center_y
         if moved_x or moved_y:
@@ -1457,7 +1366,6 @@ class VP_OT_slide(Operator):
     # ---- event handling ----------------------------------------------------------
 
     def modal(self, context, event):
-        global _last_slide_choice
         state = self._state
         kind = event.type
         try:
@@ -1474,8 +1382,6 @@ class VP_OT_slide(Operator):
                     for axis, (before, after) in enumerate(zip(self._original_all, now)):
                         if before != after:
                             self._target.autokey(context, axis)
-                    if state['manual'] and not state['is_int']:
-                        _last_slide_choice = (state['mode'], state['shift'])
                 self._cleanup(context)
                 return {'FINISHED'} if changed else {'CANCELLED'}
 
