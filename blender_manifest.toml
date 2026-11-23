@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 id = "value_precision"
 name = "Value Precision"
-version = "0.5.0"
+version = "0.8.0"
 tagline = "Type digits for exact decimals, slide values in clean steps"
 maintainer = "Bradley Animation"
 type = "add-on"
