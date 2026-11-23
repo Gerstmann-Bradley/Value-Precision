@@ -53,7 +53,7 @@ _DIV, _MUL = 'DIV', 'MUL'
 _FINE_EXTRA = 1    # decimals finer the slide step gets while Shift is held
 # Speed-sensitive sliding: below _ACCEL_SLOW pixels per second a drag is one to one; the faster the
 # mouse moves, the more steps each pixel is worth, up to _ACCEL_MAX times at _ACCEL_FAST and above.
-_ACCEL_SLOW, _ACCEL_FAST, _ACCEL_MAX = 500.0, 3000.0, 8.0
+_ACCEL_SLOW, _ACCEL_FAST, _ACCEL_MAX = 500.0, 3000.0, 7.0
 _ACCEL_SMOOTHING = 0.04  # seconds over which the measured mouse speed is averaged
 _KEYMAPS = []       # (keymap, item) pairs added at register time, removed on unregister
 _shader = None      # cached builtin shader; released in unregister()
