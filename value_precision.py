@@ -1162,13 +1162,21 @@ class VP_OT_slide(Operator):
             # Carry over what the popup showed: exponent, divide / multiply and all-axes.
             mode, shift = handoff['mode'], min(handoff['shift'], _MAX_SHIFT)
             all_axes = bool(handoff['all_axes']) and self._target.multi
+            # The same whole-number rule as a direct slide: a field without decimals never starts
+            # coarser than 0.1, even though the popup shows 0 decimals for it. An exponent chosen in
+            # the popup (or a field with decimals) is kept; Z still goes coarser during the slide.
+            if mode == _DIV and not self._target.is_int and not count_decimals(display):
+                shift = max(1, shift)
         else:
-            # Same starting-step logic as typing.
+            # Same starting-step logic as typing, except for a field without decimals (0, 1, 10 ...):
+            # typing starts it at 0 decimals, but a slide starts at 0.1, because whole steps are too
+            # coarse for a drag. Holding Shift then gives 0.01. A field that already has decimals
+            # slides in steps of its last decimal, as before.
             all_axes = False
             if self._target.is_int:
                 mode, shift = _MUL, 0
             else:
-                mode, shift = _DIV, initial_shift(display, False)
+                mode, shift = _DIV, max(1, initial_shift(display, False))
 
         self._original_all = original_all           # every axis as it was (restored on cancel)
         self._expected_all = list(original_all)     # what we last wrote (for the re-apply timer)
