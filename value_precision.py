@@ -99,7 +99,7 @@ class VP_Preferences(AddonPreferences):
     pixels_per_step: FloatProperty(
         name='Pixels per Step',
         description='Horizontal drag distance, in UI pixels, for one step',
-        default=12.0, min=1.0, soft_max=100.0)
+        default=18.0, min=1.0, soft_max=100.0)
 
     def draw(self, context):
         layout = self.layout
