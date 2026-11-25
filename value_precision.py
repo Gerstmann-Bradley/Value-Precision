@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Value Precision",
     "author": "Bradley Animation",
-    "version": (0, 8, 0),
+    "version": (0, 9, 0),
     "blender": (4, 2, 0),
     "location": "Hover a number field: press ` to type, hold middle mouse to slide",
     "description": "Type digits for exact decimals, slide values in clean steps.",
@@ -11,6 +11,7 @@ bl_info = {
 import math
 import re
 import struct
+import time
 from decimal import Decimal
 from typing import Optional
 
@@ -50,6 +51,10 @@ _TYPE_MAX_SHIFT = 5  # highest exponent on the typing popup's bar
 _MAX_DIGITS = 12    # cap on typed digits
 _DIV, _MUL = 'DIV', 'MUL'
 _FINE_EXTRA = 1    # decimals finer the slide step gets while Shift is held
+# Speed-sensitive sliding: below _ACCEL_SLOW pixels per second a drag is one to one; the faster the
+# mouse moves, the more steps each pixel is worth, up to _ACCEL_MAX times at _ACCEL_FAST and above.
+_ACCEL_SLOW, _ACCEL_FAST, _ACCEL_MAX = 500.0, 3000.0, 2
+_ACCEL_SMOOTHING = 0.04  # seconds over which the measured mouse speed is averaged
 _KEYMAPS = []       # (keymap, item) pairs added at register time, removed on unregister
 _shader = None      # cached builtin shader; released in unregister()
 _sliding = False    # True while a slide is in progress (prevents a second one starting)
@@ -99,7 +104,12 @@ class VP_Preferences(AddonPreferences):
     pixels_per_step: FloatProperty(
         name='Pixels per Step',
         description='Horizontal drag distance, in UI pixels, for one step',
-        default=18.0, min=1.0, soft_max=100.0)
+        default=10.0, min=1.0, soft_max=100.0)
+    slide_accelerate: BoolProperty(
+        name='Accelerate Fast Drags',
+        description='The faster you start dragging, the more steps each pixel is worth, so a quick flick '
+                    'makes a big change while a slow drag stays precise. Holding Shift always drags one to one',
+        default=True)
 
     def draw(self, context):
         layout = self.layout
@@ -111,6 +121,7 @@ class VP_Preferences(AddonPreferences):
         slide.prop(self, 'slide_trigger')
         slide.label(text='Inside the typing popup, the middle mouse button switches to sliding with the chosen step.')
         slide.prop(self, 'pixels_per_step')
+        slide.prop(self, 'slide_accelerate')
         slide.label(text='Middle mouse is bound in the "View2D", "View2D Buttons List" and "Window" keymaps.')
 
         box = layout.box()
@@ -1009,6 +1020,16 @@ def slide_value(original: float, step: Decimal, ticks: int) -> Optional[float]:
     return float(Decimal(index) * step)
 
 
+def accel_gain(speed: float) -> float:
+    """Multiplier for mouse movement at ``speed`` UI pixels per second (1 = one to one).
+
+    Flat below _ACCEL_SLOW, then rising smoothly (quadratically, so moderate speeds stay
+    controllable) to _ACCEL_MAX at _ACCEL_FAST and above.
+    """
+    t = max(0.0, min(1.0, (speed - _ACCEL_SLOW) / (_ACCEL_FAST - _ACCEL_SLOW)))
+    return 1.0 + (_ACCEL_MAX - 1.0) * t * t
+
+
 def _region_at(window, point):
     """The (area, region) under window coordinates ``point``.
 
@@ -1155,8 +1176,12 @@ class VP_OT_slide(Operator):
         self._mode_key = mode_key
         all_key = prefs.all_key if prefs else 'A'
         self._all_key = all_key
-        pixels = prefs.pixels_per_step if prefs else 12.0
+        pixels = prefs.pixels_per_step if prefs else 10.0
         self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
+        self._accelerate = bool(prefs.slide_accelerate) if prefs else True
+        self._ui_scale = max(.25, float(context.preferences.system.ui_scale))
+        self._speed = 0.0                   # smoothed mouse speed, in UI pixels per second
+        self._last_time = time.perf_counter()
 
         if handoff is not None:
             # Carry over what the popup showed: exponent, divide / multiply and all-axes.
@@ -1346,12 +1371,28 @@ class VP_OT_slide(Operator):
         center_x, center_y = self._center
         moved_x, moved_y = event.mouse_x - center_x, event.mouse_y - center_y
         if moved_x or moved_y:
-            self._virtual_x += moved_x
+            self._virtual_x += moved_x * self._gain(moved_x, event)
             self._window.cursor_warp(center_x, center_y)
+
+    def _gain(self, moved_x: int, event) -> float:
+        """How many pixels of drag this mouse move is worth, from how fast the mouse is going.
+
+        The speed is averaged over a few hundredths of a second so one jumpy event does not
+        matter, and it falls back at once when the mouse stops. Holding Shift (the precise
+        mode) always drags one to one.
+        """
+        if not self._accelerate:
+            return 1.0
+        now = time.perf_counter()
+        elapsed = max(now - self._last_time, 1e-3)
+        self._last_time = now
+        speed = abs(moved_x) / elapsed / self._ui_scale
+        self._speed += (speed - self._speed) * (1.0 - math.exp(-elapsed / _ACCEL_SMOOTHING))
+        return 1.0 if event.shift else accel_gain(self._speed)
 
     def _apply_drag(self, context, event) -> None:
         """Write the value for the current horizontal distance (whole steps only)."""
-        ticks = math.trunc((self._virtual_x - self._anchor_x) / self._pixels)
+        ticks = math.trunc((self._virtual_x - self._anchor_x) / self._pixels * 5)  # add a sensitivity multiplier trying to match blender behavior
         if ticks == self._ticks:
             return
         self._ticks = ticks
