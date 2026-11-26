@@ -74,9 +74,12 @@ class VP_Preferences(AddonPreferences):
 
     bl_idname = __package__
 
-    click_passthrough: BoolProperty(
-        name='Click Also Acts Normally',
-        description='A confirming mouse click is also passed on, so it can start the next field right away',
+    adjust_existing: BoolProperty(
+        name='Adjust Existing Value',
+        description='With nothing typed, changing the sign, exponent or divide / multiply in the popup edits the '
+                    "field's current value: the sign flips it, and a new exponent moves its decimal point "
+                    '(33.6 with the exponent raised from 1 to 3 becomes 0.336). When off, those controls only '
+                    'affect the digits you type next, and confirming with nothing typed leaves the field untouched',
         default=True)
     # Stored as event-type identifiers so they survive restarts; set through VP_OT_capture_key.
     coarser_key: StringProperty(name='Coarser Key', description='Decrease the exponent (fewer decimals)', default='Z')
@@ -105,15 +108,10 @@ class VP_Preferences(AddonPreferences):
         name='Pixels per Step',
         description='Horizontal drag distance, in UI pixels, for one step',
         default=10.0, min=1.0, soft_max=100.0)
-    slide_accelerate: BoolProperty(
-        name='Accelerate Fast Drags',
-        description='The faster you start dragging, the more steps each pixel is worth, so a quick flick '
-                    'makes a big change while a slow drag stays precise. Holding Shift always drags one to one',
-        default=True)
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, 'click_passthrough')
+        layout.prop(self, 'adjust_existing')
 
         slide = layout.box()
         slide.label(text='Sliding (hold middle mouse over a field and drag)')
@@ -121,7 +119,6 @@ class VP_Preferences(AddonPreferences):
         slide.prop(self, 'slide_trigger')
         slide.label(text='Inside the typing popup, the middle mouse button switches to sliding with the chosen step.')
         slide.prop(self, 'pixels_per_step')
-        slide.prop(self, 'slide_accelerate')
         slide.label(text='Middle mouse is bound in the "View2D", "View2D Buttons List" and "Window" keymaps.')
 
         box = layout.box()
@@ -758,7 +755,8 @@ class VP_OT_entry(Operator):
             return {'PASS_THROUGH'}
 
         prefs = _prefs(context)
-        self._passthrough = prefs.click_passthrough if prefs else True
+        self._passthrough = True  # a confirming click is also passed on, so it can start the next field right away
+        self._adjust_existing = prefs.adjust_existing if prefs else True
         self._trigger = event.type  # pressing the same key again confirms (unless it has another job)
         coarser = prefs.coarser_key if prefs else 'Z'
         finer = prefs.finer_key if prefs else 'X'
@@ -900,8 +898,11 @@ class VP_OT_entry(Operator):
         0.336. Typing a digit replaces the starting value.
 
         Returns one value per axis (a single value unless all axes are on), or None when
-        nothing was changed or there is nothing to change (a value of 0).
+        nothing was changed, there is nothing to change (a value of 0), or the "Adjust
+        Existing Value" preference is off.
         """
+        if not self._adjust_existing:
+            return None  # feature switched off in the preferences
         state = self._state
         negative0, mode0, shift0 = state['initial']
         exponent = lambda mode, shift: -shift if mode == _DIV else shift
@@ -1235,7 +1236,7 @@ class VP_OT_slide(Operator):
         self._all_key = all_key
         pixels = prefs.pixels_per_step if prefs else 10.0
         self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
-        self._accelerate = bool(prefs.slide_accelerate) if prefs else True
+        self._accelerate = True  # faster drags are worth more steps per pixel (Shift always drags one to one)
         self._ui_scale = max(.25, float(context.preferences.system.ui_scale))
         self._speed = 0.0                   # smoothed mouse speed, in UI pixels per second
         self._last_time = time.perf_counter()
