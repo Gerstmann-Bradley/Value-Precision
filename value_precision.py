@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Value Precision",
     "author": "Bradley Animation",
-    "version": (0, 9, 0),
+    "version": (1, 0, 0),
     "blender": (4, 2, 0),
     "location": "Hover a number field: press ` to type, hold middle mouse to slide",
     "description": "Type digits for exact decimals, slide values in clean steps.",
@@ -74,9 +74,12 @@ class VP_Preferences(AddonPreferences):
 
     bl_idname = __package__
 
-    click_passthrough: BoolProperty(
-        name='Click Also Acts Normally',
-        description='A confirming mouse click is also passed on, so it can start the next field right away',
+    adjust_existing: BoolProperty(
+        name='Adjust Existing Value',
+        description='With nothing typed, changing the sign, exponent or divide / multiply in the popup edits the '
+                    "field's current value: the sign flips it, and a new exponent moves its decimal point "
+                    '(33.6 with the exponent raised from 1 to 3 becomes 0.336). When off, those controls only '
+                    'affect the digits you type next, and confirming with nothing typed leaves the field untouched',
         default=True)
     # Stored as event-type identifiers so they survive restarts; set through VP_OT_capture_key.
     coarser_key: StringProperty(name='Coarser Key', description='Decrease the exponent (fewer decimals)', default='Z')
@@ -105,15 +108,10 @@ class VP_Preferences(AddonPreferences):
         name='Pixels per Step',
         description='Horizontal drag distance, in UI pixels, for one step',
         default=10.0, min=1.0, soft_max=100.0)
-    slide_accelerate: BoolProperty(
-        name='Accelerate Fast Drags',
-        description='The faster you start dragging, the more steps each pixel is worth, so a quick flick '
-                    'makes a big change while a slow drag stays precise. Holding Shift always drags one to one',
-        default=True)
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, 'click_passthrough')
+        layout.prop(self, 'adjust_existing')
 
         slide = layout.box()
         slide.label(text='Sliding (hold middle mouse over a field and drag)')
@@ -121,7 +119,6 @@ class VP_Preferences(AddonPreferences):
         slide.prop(self, 'slide_trigger')
         slide.label(text='Inside the typing popup, the middle mouse button switches to sliding with the chosen step.')
         slide.prop(self, 'pixels_per_step')
-        slide.prop(self, 'slide_accelerate')
         slide.label(text='Middle mouse is bound in the "View2D", "View2D Buttons List" and "Window" keymaps.')
 
         box = layout.box()
@@ -266,6 +263,17 @@ def preview_text(negative: bool, digits: str, shift: int, mode: str) -> str:
     if not digits:
         return '—'
     return format(_scaled(negative, digits, shift, mode), 'f')
+
+
+def shift_decimal(value: float, places: int, flip: bool = False) -> float:
+    """``value`` with its decimal point moved ``places`` to the right (negative: to the left).
+
+    ``flip`` negates the result. It works on the cleaned decimal, so float noise is dropped:
+    33.599998474 (how a 32-bit float stores 33.6) moved two places left is exactly 0.336.
+    """
+    clean = Decimal(f'{value:.{count_decimals(value)}f}')
+    result = clean.scaleb(places)
+    return float(-result if flip else result) + 0.0  # + 0.0 turns -0.0 into 0.0
 
 
 class Target:
@@ -747,7 +755,8 @@ class VP_OT_entry(Operator):
             return {'PASS_THROUGH'}
 
         prefs = _prefs(context)
-        self._passthrough = prefs.click_passthrough if prefs else True
+        self._passthrough = True  # a confirming click is also passed on, so it can start the next field right away
+        self._adjust_existing = prefs.adjust_existing if prefs else True
         self._trigger = event.type  # pressing the same key again confirms (unless it has another job)
         coarser = prefs.coarser_key if prefs else 'Z'
         finer = prefs.finer_key if prefs else 'X'
@@ -780,6 +789,7 @@ class VP_OT_entry(Operator):
             'is_int': self._target.is_int,
             'digits': '',
             'negative': negative,
+            'initial': (negative, mode, shift),  # what the popup started as, to see what was changed
             'sign_rects': None,    # ((+ rect), (− rect)), set by _draw
             'dragging': False,     # True while the mouse is scrubbing the bar
             'slider': None,        # (left, bottom, width, height) of the bar, set by _draw
@@ -840,11 +850,13 @@ class VP_OT_entry(Operator):
         context.region.tag_redraw()
 
     def _to_slide(self, context, event):
-        """Middle mouse inside the popup: apply what was typed, then continue as a slide.
+        """Middle mouse inside the popup: confirm it, then continue as a slide.
 
-        The slide starts from the field's new value with the exponent, divide / multiply and
-        all-axes settings shown in the popup. If nothing was typed the field is left untouched.
-        The typed value is its own undo step, and cancelling the slide returns to that value.
+        Like any other way of confirming, this applies what was typed, or else a change of the
+        sign or decimals. The slide starts from the field's new value with the exponent,
+        divide / multiply and all-axes settings shown in the popup. If nothing was typed or
+        changed the field is left untouched. The applied value is its own undo step, and
+        cancelling the slide returns to that value.
         """
         global _handoff
         prefs = _prefs(context)
@@ -852,9 +864,9 @@ class VP_OT_entry(Operator):
             return {'RUNNING_MODAL'}  # sliding is switched off: ignore the button
         state = self._state
         self._cleanup(context)  # closes the popup
-        typed = bool(state['digits'])
-        result = self._commit(context)  # applies the typed value, if any
-        if typed and 'FINISHED' not in result:
+        pending = bool(state['digits']) or self._shifted_original() is not None
+        result = self._commit(context)  # applies the typed value or the sign / decimal change, if any
+        if pending and 'FINISHED' not in result:
             return result  # the write failed; do not start a slide on a field in an unknown state
         _handoff = {
             'target': self._target, 'area': self._area, 'region': self._region,
@@ -869,26 +881,72 @@ class VP_OT_entry(Operator):
             pass  # the slide could not start; the popup is closed
         finally:
             _handoff = None  # never leave a stale handoff behind
-        return {'FINISHED'} if typed else {'CANCELLED'}
+        return {'FINISHED'} if pending else {'CANCELLED'}
 
     def _confirm(self, context):
         """Close the popup and apply the typed value. Returns the operator result set."""
         self._cleanup(context)
         return self._commit(context)
 
+    def _shifted_original(self):
+        """New display values for the field after a sign or decimal change with nothing typed.
+
+        The popup starts out as the field's own value written the way you would type it (its
+        digits, exponent and sign), although those digits are not shown. So changing only the
+        sign negates the value, and changing only the exponent or divide / multiply moves its
+        decimal point by the difference: 33.6 with the exponent raised from 1 to 3 becomes
+        0.336. Typing a digit replaces the starting value.
+
+        Returns one value per axis (a single value unless all axes are on), or None when
+        nothing was changed, there is nothing to change (a value of 0), or the "Adjust
+        Existing Value" preference is off.
+        """
+        if not self._adjust_existing:
+            return None  # feature switched off in the preferences
+        state = self._state
+        negative0, mode0, shift0 = state['initial']
+        exponent = lambda mode, shift: -shift if mode == _DIV else shift
+        places = exponent(state['mode'], state['shift']) - exponent(mode0, shift0)
+        flip = state['negative'] != negative0
+        if not places and not flip:
+            return None
+        target = self._target
+        if state['all_axes'] and state['multi']:
+            values = [target.to_display(raw) for raw in target.raw_values()]
+        else:
+            values = [target.display()]
+        if not any(values):
+            return None
+        return [shift_decimal(value, places, flip) for value in values]
+
     def _commit(self, context):
-        """Write the typed value, if any, to the field. Returns the operator result set."""
+        """Write the typed value, or else the sign / decimal change, to the field.
+
+        Returns the operator result set. With nothing typed and nothing changed the field is
+        left exactly as it was.
+        """
         state = self._state
         value = shifted_value(state['negative'], state['digits'], state['shift'], state['mode'])
+        shifted = None
         if value is None:
-            return {'CANCELLED'}  # nothing typed: leave the field untouched
+            shifted = self._shifted_original()
+            if shifted is None:
+                return {'CANCELLED'}  # nothing typed and nothing changed: leave the field untouched
         try:
-            if state['all_axes'] and state['multi']:
+            every = state['all_axes'] and state['multi']
+            if shifted is not None:
+                if every:
+                    self._target.write_raw_values([self._target.to_raw(v) for v in shifted])
+                else:
+                    self._target.write(shifted[0])
+            elif every:
                 self._target.write_all(value)
+            else:
+                self._target.write(value)
+            if every:
                 for axis in range(self._target.count()):
                     self._target.autokey(context, axis)
             else:
-                self._target.write(value)
                 self._target.autokey(context)
         except (ReferenceError, AttributeError, TypeError, ValueError, RuntimeError, KeyError):
             self.report({'ERROR'}, 'The field changed or became invalid')
@@ -1178,7 +1236,7 @@ class VP_OT_slide(Operator):
         self._all_key = all_key
         pixels = prefs.pixels_per_step if prefs else 10.0
         self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
-        self._accelerate = bool(prefs.slide_accelerate) if prefs else True
+        self._accelerate = True  # faster drags are worth more steps per pixel (Shift always drags one to one)
         self._ui_scale = max(.25, float(context.preferences.system.ui_scale))
         self._speed = 0.0                   # smoothed mouse speed, in UI pixels per second
         self._last_time = time.perf_counter()
