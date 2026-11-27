@@ -93,10 +93,6 @@ class VP_Preferences(AddonPreferences):
         name='All Axes Key',
         description='Toggle applying the change to every axis of a vector, while typing or sliding',
         default='A')
-    slide_enabled: BoolProperty(
-        name='Middle Mouse Sliding',
-        description='Hold the middle mouse button over a number field and drag to change it in clean steps',
-        default=True)
     slide_trigger: EnumProperty(
         name='Slide Trigger',
         description='How a slide is started. Pressing the middle mouse button inside the typing popup '
@@ -119,7 +115,6 @@ class VP_Preferences(AddonPreferences):
 
         slide = layout.box()
         slide.label(text='Sliding (hold middle mouse over a field and drag)')
-        slide.prop(self, 'slide_enabled')
         slide.prop(self, 'slide_trigger')
         slide.label(text='Inside the typing popup, the middle mouse button switches to sliding with the chosen step.')
         slide.prop(self, 'slide_sensitivity')
@@ -871,9 +866,6 @@ class VP_OT_entry(Operator):
         cancelling the slide returns to that value.
         """
         global _handoff
-        prefs = _prefs(context)
-        if prefs is not None and not prefs.slide_enabled:
-            return {'RUNNING_MODAL'}  # sliding is switched off: ignore the button
         state = self._state
         self._cleanup(context)  # closes the popup
         pending = bool(state['digits']) or self._shifted_original() is not None
@@ -1204,8 +1196,6 @@ class VP_OT_slide(Operator):
         if _sliding or window is None:
             return {'PASS_THROUGH'}
         prefs = _prefs(context)
-        if prefs is not None and not prefs.slide_enabled:
-            return {'PASS_THROUGH'}
 
         if handoff is not None:
             # Started from the typing popup: the field, region and step are already known.
