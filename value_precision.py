@@ -54,6 +54,7 @@ _FINE_EXTRA = 1    # decimals finer the slide step gets while Shift is held
 # Speed-sensitive sliding: below _ACCEL_SLOW pixels per second a drag is one to one; the faster the
 # mouse moves, the more steps each pixel is worth, up to _ACCEL_MAX times at _ACCEL_FAST and above.
 _ACCEL_SLOW, _ACCEL_FAST, _ACCEL_MAX = 500.0, 3000.0, 2
+_PIXELS_PER_STEP = 10.0  # UI pixels of horizontal drag per step, before the sensitivity multiplier
 _ACCEL_SMOOTHING = 0.04  # seconds over which the measured mouse speed is averaged
 _KEYMAPS = []       # (keymap, item) pairs added at register time, removed on unregister
 _shader = None      # cached builtin shader; released in unregister()
@@ -104,10 +105,11 @@ class VP_Preferences(AddonPreferences):
                 'Open the typing popup first, then press the middle mouse button inside it. '
                 'Plain middle mouse over a field always pans')),
         default='DIRECT')
-    pixels_per_step: FloatProperty(
-        name='Pixels per Step',
-        description='Horizontal drag distance, in UI pixels, for one step',
-        default=10.0, min=1.0, soft_max=100.0)
+    slide_sensitivity: FloatProperty(
+        name='Slide Sensitivity',
+        description='How many steps a drag is worth: higher values change the value faster for the same '
+                    'mouse movement, lower values give finer control',
+        default=5.0, min=0.1, soft_max=20.0)
 
     def draw(self, context):
         layout = self.layout
@@ -118,7 +120,7 @@ class VP_Preferences(AddonPreferences):
         slide.prop(self, 'slide_enabled')
         slide.prop(self, 'slide_trigger')
         slide.label(text='Inside the typing popup, the middle mouse button switches to sliding with the chosen step.')
-        slide.prop(self, 'pixels_per_step')
+        slide.prop(self, 'slide_sensitivity')
         slide.label(text='Middle mouse is bound in the "View2D", "View2D Buttons List" and "Window" keymaps.')
 
         box = layout.box()
@@ -1234,8 +1236,8 @@ class VP_OT_slide(Operator):
         self._mode_key = mode_key
         all_key = prefs.all_key if prefs else 'A'
         self._all_key = all_key
-        pixels = prefs.pixels_per_step if prefs else 10.0
-        self._pixels = max(1.0, pixels) * max(.25, float(context.preferences.system.ui_scale))
+        self._pixels = _PIXELS_PER_STEP * max(.25, float(context.preferences.system.ui_scale))
+        self._sensitivity = max(0.1, prefs.slide_sensitivity) if prefs else 5.0
         self._accelerate = True  # faster drags are worth more steps per pixel (Shift always drags one to one)
         self._ui_scale = max(.25, float(context.preferences.system.ui_scale))
         self._speed = 0.0                   # smoothed mouse speed, in UI pixels per second
@@ -1450,7 +1452,7 @@ class VP_OT_slide(Operator):
 
     def _apply_drag(self, context, event) -> None:
         """Write the value for the current horizontal distance (whole steps only)."""
-        ticks = math.trunc((self._virtual_x - self._anchor_x) / self._pixels * 5)  # add a sensitivity multiplier trying to match blender behavior
+        ticks = math.trunc((self._virtual_x - self._anchor_x) / self._pixels * self._sensitivity)  # sensitivity multiplier (preference), tuned to match Blender's feel
         if ticks == self._ticks:
             return
         self._ticks = ticks
