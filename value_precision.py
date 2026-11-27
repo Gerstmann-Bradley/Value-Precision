@@ -83,8 +83,8 @@ class VP_Preferences(AddonPreferences):
                     'affect the digits you type next, and confirming with nothing typed leaves the field untouched',
         default=True)
     # Stored as event-type identifiers so they survive restarts; set through VP_OT_capture_key.
-    coarser_key: StringProperty(name='Coarser Key', description='Decrease the exponent (fewer decimals)', default='Z')
-    finer_key: StringProperty(name='Finer Key', description='Increase the exponent (more decimals)', default='X')
+    coarser_key: StringProperty(name='Coarser Key', description='Coarser step (fewer decimals); past ÷10^0 it continues into ×10, ×100 ...', default='Z')
+    finer_key: StringProperty(name='Finer Key', description='Finer step (more decimals); past ×10^0 it continues into ÷10, ÷100 ...', default='X')
     mode_key: StringProperty(name='Mode Key', description='Switch between divide and multiply', default='C')
     sign_key: StringProperty(name='Sign Key', description='Switch between positive and negative', default='V')
     all_key: StringProperty(
@@ -125,8 +125,8 @@ class VP_Preferences(AddonPreferences):
 
         box = layout.box()
         box.label(text='Keys inside the popup and while sliding (click, then press a key)')
-        for attr, label in (('coarser_key', 'Coarser (smaller exponent)'),
-                            ('finer_key', 'Finer (bigger exponent)'),
+        for attr, label in (('coarser_key', 'Coarser step'),
+                            ('finer_key', 'Finer step'),
                             ('mode_key', 'Switch ÷ / ×'),
                             ('sign_key', 'Switch + / −'),
                             ('all_key', 'All axes (vectors)')):
@@ -134,7 +134,7 @@ class VP_Preferences(AddonPreferences):
             row.label(text=label)
             op = row.operator(VP_OT_capture_key.bl_idname, text=key_name(getattr(self, attr)))
             op.target = attr
-        box.label(text='Mouse wheel and Up / Down arrows also change the exponent; the bar and switch work with the mouse.')
+        box.label(text='Mouse wheel and Up / Down arrows also change the step; the bar and switch work with the mouse.')
 
         layout.label(text='Typing: digits, Minus, Backspace.  Confirm: Space, Enter, trigger key again, or a click outside the popup.')
         layout.label(text='Cancel: Esc or right click.')
@@ -638,7 +638,7 @@ def _draw(state: dict) -> None:
     main = f'{entry}   {operator} 10^{shift}   =   {preview_text(negative, digits, shift, mode)}'
     title = state['label']
     # Coarser key first, finer key second: left to right matches the direction of the bar.
-    hint_keys = (f"{state['coarser_name']} / {state['finer_name']}: exponent   "
+    hint_keys = (f"{state['coarser_name']} / {state['finer_name']}: coarser / finer   "
                  f"{state['mode_name']}: ÷ ×   {state['sign_name']}: + −"
                  + (f"   {state['all_name']}: all axes" if state['multi'] else ''))
     hint_actions = 'Space: apply   MMB: slide   RMB: cancel'
@@ -844,6 +844,23 @@ class VP_OT_entry(Operator):
         self._state['shift'] = value
         context.region.tag_redraw()
 
+    def _nudge(self, context, finer: bool) -> None:
+        """One step finer or coarser, crossing between ÷ and × at zero.
+
+        The bar only ever shows 0..5, but behind it the exponent is one signed scale: ÷10^2 is
+        0.01 and, one coarser step past ÷10^0, ×10^1 is 10. A negative exponent therefore only
+        appears when you step past zero. Integer fields cannot go finer than ×10^0.
+        """
+        state = self._state
+        d = state['shift'] if state['mode'] == _DIV else -state['shift']  # signed: > 0 is ÷, < 0 is ×
+        d += 1 if finer else -1
+        if state['is_int']:
+            d = min(d, 0)
+        d = max(-_TYPE_MAX_SHIFT, min(_TYPE_MAX_SHIFT, d))
+        state['mode'] = _MUL if (state['is_int'] or d < 0) else _DIV
+        state['shift'] = abs(d)
+        context.region.tag_redraw()
+
     def _set_mode(self, context, mode: str) -> None:
         """Switch between divide and multiply (not available for integer fields)."""
         if self._state['is_int']:
@@ -1036,9 +1053,9 @@ class VP_OT_entry(Operator):
         elif kind == 'BACK_SPACE':
             state['digits'] = state['digits'][:-1]
         elif kind in self._coarser:
-            self._set_shift(context, max(0, state['shift'] - 1))
+            self._nudge(context, finer=False)
         elif kind in self._finer:
-            self._set_shift(context, min(_TYPE_MAX_SHIFT, state['shift'] + 1))
+            self._nudge(context, finer=True)
         elif kind == self._mode_key:
             self._set_mode(context, _DIV if state['mode'] == _MUL else _MUL)
         elif kind == self._all_key and state['multi']:
@@ -1384,6 +1401,16 @@ class VP_OT_slide(Operator):
         self._update_effective()
         self._reanchor(context, event)
 
+    def _nudge(self, context, event, finer: bool) -> None:
+        """One step finer or coarser, crossing between ÷ and × at zero (see VP_OT_entry._nudge)."""
+        state = self._state
+        d = state['shift'] if state['mode'] == _DIV else -state['shift']  # signed: > 0 is ÷, < 0 is ×
+        d += 1 if finer else -1
+        if state['is_int']:
+            d = min(d, 0)
+        d = max(-_MAX_SHIFT, min(_MAX_SHIFT, d))
+        self._set_step(context, event, shift=abs(d), mode=_MUL if (state['is_int'] or d < 0) else _DIV)
+
     def _follow(self) -> None:
         """Make every other axis follow the hovered axis' total change since the drag began.
 
@@ -1509,9 +1536,9 @@ class VP_OT_slide(Operator):
                     self._target.write_raw_values(self._expected_all)
             elif event.value == 'PRESS':
                 if kind in self._coarser:
-                    self._set_step(context, event, shift=max(0, state['shift'] - 1))
+                    self._nudge(context, event, finer=False)
                 elif kind in self._finer:
-                    self._set_step(context, event, shift=min(_MAX_SHIFT, state['shift'] + 1))
+                    self._nudge(context, event, finer=True)
                 elif kind == self._mode_key and not state['is_int']:
                     self._set_step(context, event, mode=_DIV if state['mode'] == _MUL else _MUL)
                 elif kind == self._all_key and state['multi']:
