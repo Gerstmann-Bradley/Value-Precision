@@ -30,7 +30,7 @@ It works everywhere in Blender. For simplicity, most demonstrations use Geometry
 
 All shortcuts are modifiable in the preferences
 
-<img width="650" height="347" alt="image" src="https://github.com/user-attachments/assets/08cb8ea2-1bd2-44e8-ad04-df6d941c70b9" />
+<img width="663" height="381" alt="image" src="https://github.com/user-attachments/assets/0f61c65d-6064-49b8-a035-fde4b6f8fa12" />
 
 
 # Sliding Values
@@ -49,7 +49,7 @@ To avoid accidents that you want to pan but you end up sliding values in the nod
 
 There's an option in the preference to slide only with the popup
 
-<img width="655" height="181" alt="image" src="https://github.com/user-attachments/assets/d88adc9f-43e3-457a-b7f5-b8c59f0f2ccb" />
+<img width="824" height="222" alt="image" src="https://github.com/user-attachments/assets/92aff478-3b7f-4f18-a3f0-2c1a58bca918" />
 
 So the process becomes:
 
@@ -83,3 +83,22 @@ X: 0.05 -> X: 0.06
 Y: 1.00 -> Y: 1.01
 ```
 
+# Ajusting Existing Values
+
+0. By Default, Adjust Existing Value Option is turned on in Preference.
+
+<img width="673" height="167" alt="image" src="https://github.com/user-attachments/assets/db5341ea-7ab8-4d05-9119-21c41e65a06b" />
+
+1. When you hover the socket and open up the panel, Auto-Detection will instruct you its current decimals.
+
+If you don't make any changes, whether clicking outside or RMB canceling, the value will stay as it is.
+
+<img width="494" height="162" alt="image" src="https://github.com/user-attachments/assets/9e2acb2b-cd27-474c-9f81-b18cbb9a168d" />
+
+2. However, if you modify the decimals without inputting any other values.
+
+<img width="464" height="160" alt="image" src="https://github.com/user-attachments/assets/e2cb0b45-8ae3-49c3-b7af-a97771562fd9" />
+
+3. If you apply the value, it will adjust the existing values. In this case decimal has decreased by 1, so 0.59 becomes 5.9
+
+<img width="369" height="66" alt="image" src="https://github.com/user-attachments/assets/3db18bca-ed5c-4984-b45d-cc67002133db" />
