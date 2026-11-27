@@ -47,7 +47,9 @@ _FINER_EXTRA = frozenset({'UP_ARROW', 'WHEELUPMOUSE'})
 _COARSER_EXTRA = frozenset({'DOWN_ARROW', 'WHEELDOWNMOUSE'})
 
 _MAX_SHIFT = 9      # highest power of ten (used by sliding, which has no bar)
-_TYPE_MAX_SHIFT = 5  # highest exponent on the typing popup's bar
+_TYPE_MAX_SHIFT = 5  # highest exponent on the typing popup's bar; the bar shows 6 of them at a time
+# Below zero the exponent continues (÷10^-1 is x10, x10^-1 is ÷10) down to -_TYPE_MAX_SHIFT for decimal
+# fields. The bar normally shows 0..5 and only slides left, to -1..4, -2..3 ..., once the exponent goes negative.
 _MAX_DIGITS = 12    # cap on typed digits
 _DIV, _MUL = 'DIV', 'MUL'
 _FINE_EXTRA = 1    # decimals finer the slide step gets while Shift is held
@@ -83,7 +85,7 @@ class VP_Preferences(AddonPreferences):
                     'affect the digits you type next, and confirming with nothing typed leaves the field untouched',
         default=True)
     # Stored as event-type identifiers so they survive restarts; set through VP_OT_capture_key.
-    coarser_key: StringProperty(name='Coarser Key', description='Decrease the exponent (fewer decimals)', default='Z')
+    coarser_key: StringProperty(name='Coarser Key', description='Decrease the exponent (fewer decimals); it can go below zero', default='Z')
     finer_key: StringProperty(name='Finer Key', description='Increase the exponent (more decimals)', default='X')
     mode_key: StringProperty(name='Mode Key', description='Switch between divide and multiply', default='C')
     sign_key: StringProperty(name='Sign Key', description='Switch between positive and negative', default='V')
@@ -705,14 +707,19 @@ def _draw(state: dict) -> None:
 
     bar = (track_left, row_bottom, cell * (_TYPE_MAX_SHIFT + 1), row_height)
     state['slider'] = bar
+    # First exponent shown: 0 normally, the current exponent once it is negative. While the bar is
+    # being scrubbed the window is held still, so the cells do not move under the mouse.
+    start = state['bar_lock'] if state['bar_lock'] is not None else min(0, shift)
+    state['bar_start'] = start
     _fill(*bar, track_bg, radius * .6)
     for i in range(_TYPE_MAX_SHIFT + 1):
         rect = (bar[0] + cell * i, row_bottom, cell, row_height)
-        if i == shift:
+        exponent = start + i
+        if exponent == shift:
             _fill(*rect, selected, radius * .6)                 # current exponent
-        elif i < shift:
+        elif exponent < shift:
             _fill(*rect, _mix(inner, selected, .35))            # tint everything below it
-        _text(str(i), base, rect, text_sel if i == shift else text_c, 'CENTER')
+        _text(str(exponent), base, rect, text_sel if exponent == shift else text_c, 'CENTER')
     y += heights[2]
 
     _fill(left + inset * 2, y, width - inset * 4, heights[3], selected, radius * .8)
@@ -795,6 +802,8 @@ class VP_OT_entry(Operator):
             'sign_rects': None,    # ((+ rect), (− rect)), set by _draw
             'dragging': False,     # True while the mouse is scrubbing the bar
             'slider': None,        # (left, bottom, width, height) of the bar, set by _draw
+            'bar_start': 0,        # exponent of the bar's first cell, set by _draw
+            'bar_lock': None,      # bar_start held fixed while the bar is scrubbed
             'mode_rects': None,    # ((÷ rect), (× rect)), set by _draw
             'card': None,          # rectangle of the whole popup
             'coarser_name': key_name(coarser),
@@ -835,9 +844,10 @@ class VP_OT_entry(Operator):
 
     @staticmethod
     def _cell(state, x) -> int:
-        """Exponent under region x coordinate ``x`` on the bar (clamped to 0..9)."""
+        """Exponent under region x coordinate ``x`` on the bar (the bar may start below zero)."""
         left, _bottom, width, _height = state['slider']
-        return max(0, min(_TYPE_MAX_SHIFT, int((x - left) / (width / (_TYPE_MAX_SHIFT + 1)))))
+        index = max(0, min(_TYPE_MAX_SHIFT, int((x - left) / (width / (_TYPE_MAX_SHIFT + 1)))))
+        return state['bar_start'] + index
 
     def _set_shift(self, context, value: int) -> None:
         """Change the exponent."""
@@ -974,6 +984,7 @@ class VP_OT_entry(Operator):
                 return {'RUNNING_MODAL'}
             if kind == 'LEFTMOUSE' and event.value == 'RELEASE':
                 state['dragging'] = False
+                state['bar_lock'] = None
                 return {'RUNNING_MODAL'}
 
         # 2. Plain mouse movement and timers pass through so the UI stays responsive.
@@ -1000,6 +1011,7 @@ class VP_OT_entry(Operator):
                         return {'RUNNING_MODAL'}
             if state['slider'] and self._inside(state['slider'], x, y):
                 state['dragging'] = True
+                state['bar_lock'] = state['bar_start']
                 self._set_shift(context, self._cell(state, x))
                 return {'RUNNING_MODAL'}
             if self._inside(state['card'], x, y):
@@ -1036,7 +1048,7 @@ class VP_OT_entry(Operator):
         elif kind == 'BACK_SPACE':
             state['digits'] = state['digits'][:-1]
         elif kind in self._coarser:
-            self._set_shift(context, max(0, state['shift'] - 1))
+            self._set_shift(context, max(0 if state['is_int'] else -_TYPE_MAX_SHIFT, state['shift'] - 1))
         elif kind in self._finer:
             self._set_shift(context, min(_TYPE_MAX_SHIFT, state['shift'] + 1))
         elif kind == self._mode_key:
@@ -1250,8 +1262,8 @@ class VP_OT_slide(Operator):
             # The same whole-number rule as a direct slide: a field without decimals never starts
             # coarser than 0.1, even though the popup shows 0 decimals for it. An exponent chosen in
             # the popup (or a field with decimals) is kept; Z still goes coarser during the slide.
-            if mode == _DIV and not self._target.is_int and not count_decimals(display):
-                shift = max(1, shift)
+            if mode == _DIV and not self._target.is_int and not count_decimals(display) and shift == 0:
+                shift = 1
         else:
             # Same starting-step logic as typing, except for a field without decimals (0, 1, 10 ...):
             # typing starts it at 0 decimals, but a slide starts at 0.1, because whole steps are too
@@ -1314,7 +1326,8 @@ class VP_OT_slide(Operator):
         state = self._state
         try:
             value = self._target.display()
-            decimals = max(0 if state['mode'] == _MUL else state['eff_shift'], count_decimals(value))
+            step_decimals = max(0, state['eff_shift'] if state['mode'] == _DIV else -state['eff_shift'])
+            decimals = max(step_decimals, count_decimals(value))
             state['value_text'] = f'{value:.{decimals}f}'
         except _SLIDE_ERRORS:
             pass
@@ -1362,7 +1375,7 @@ class VP_OT_slide(Operator):
         extra = _FINE_EXTRA if state['fine'] and not state['is_int'] else 0
         # Finer means a smaller step: a bigger exponent when dividing, a smaller one when multiplying.
         shift = state['shift'] + extra if state['mode'] == _DIV else state['shift'] - extra
-        state['eff_shift'] = max(0, min(_MAX_SHIFT, shift))
+        state['eff_shift'] = max(0 if state['is_int'] else -_MAX_SHIFT, min(_MAX_SHIFT, shift))
 
     def _reanchor(self, context, event) -> None:
         """Continue the drag from the current value, so a step change never makes it jump."""
@@ -1509,7 +1522,7 @@ class VP_OT_slide(Operator):
                     self._target.write_raw_values(self._expected_all)
             elif event.value == 'PRESS':
                 if kind in self._coarser:
-                    self._set_step(context, event, shift=max(0, state['shift'] - 1))
+                    self._set_step(context, event, shift=max(0 if state['is_int'] else -_MAX_SHIFT, state['shift'] - 1))
                 elif kind in self._finer:
                     self._set_step(context, event, shift=min(_MAX_SHIFT, state['shift'] + 1))
                 elif kind == self._mode_key and not state['is_int']:
