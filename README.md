@@ -95,10 +95,12 @@ If you don't make any changes, whether clicking outside or RMB canceling, the va
 
 <img width="494" height="162" alt="image" src="https://github.com/user-attachments/assets/9e2acb2b-cd27-474c-9f81-b18cbb9a168d" />
 
-2. However, if you modify the decimals without inputting any other values.
+2. However, if you change the decimal position without entering any new values,
+
+here, decreasing the decimal places by 1 is equivalent to multiplying the value by 10.
 
 <img width="464" height="160" alt="image" src="https://github.com/user-attachments/assets/e2cb0b45-8ae3-49c3-b7af-a97771562fd9" />
 
-3. If you apply the value, it will adjust the existing values. In this case decimal has decreased by 1, so 0.59 becomes 5.9
+3. When you apply the change, the existing values are adjusted accordingly, turning 0.59 into 5.9.
 
 <img width="369" height="66" alt="image" src="https://github.com/user-attachments/assets/3db18bca-ed5c-4984-b45d-cc67002133db" />
