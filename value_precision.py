@@ -229,16 +229,28 @@ def count_decimals(value: float) -> int:
     return len(f'{value:.6f}'.rstrip('0').partition('.')[2])
 
 
-def initial_shift(display_value: float, is_int: bool, limit: int = _MAX_SHIFT) -> int:
+def round_to_display(value: float, precision: Optional[int]) -> float:
+    """``value`` rounded to the decimals the field displays (unchanged when that is unknown)."""
+    if precision is None or not math.isfinite(value):
+        return value
+    return round(value, precision)
+
+
+def initial_shift(display_value: float, is_int: bool, limit: int = _MAX_SHIFT,
+                  precision: Optional[int] = None) -> int:
     """Auto-detected starting exponent (for ÷) of a field currently showing ``display_value``.
 
     It is the number of decimals the value has (0.05 -> 2), so typing 3 gives 0.03. Fields
     without decimals (0, 1, 10 ...) start at 0. Integer fields always use 0 (they start in
     multiply mode, see ``invoke``).
+
+    ``precision`` is the number of decimals the field displays. A stored value can differ from
+    what is shown by more than float32 noise (1.19999 is displayed as 1.2), so the value is
+    rounded to the displayed precision first: what you see is what gets detected.
     """
     if is_int:
         return 0
-    return min(limit, count_decimals(display_value))
+    return min(limit, count_decimals(round_to_display(display_value, precision)))
 
 
 def _scaled(negative: bool, digits: str, shift: int, mode: str) -> Decimal:
@@ -304,6 +316,7 @@ class Target:
         if not isinstance(self.pointer, bpy.types.bpy_struct):
             raise ValueError('Not a numeric field')
         self.rotation = False  # True when the field is shown in degrees but stored in radians
+        self.precision = None  # decimals the field displays (RNA float properties only)
 
         if self.custom:
             value = self.pointer[self.name]
@@ -321,6 +334,8 @@ class Target:
                 raise ValueError('The field is read-only')
             self.array = prop.is_array
             self.is_int = prop.type == 'INT'
+            if prop.type == 'FLOAT':
+                self.precision = prop.precision
             self.rotation = (prop.type == 'FLOAT' and prop.unit == 'ROTATION'
                              and context.scene.unit_settings.system_rotation == 'DEGREES')
         if self.array and index < 0:
@@ -780,7 +795,7 @@ class VP_OT_entry(Operator):
         if self._target.is_int:
             mode, shift = _MUL, 0
         else:
-            mode, shift = _DIV, initial_shift(display, False, _TYPE_MAX_SHIFT)
+            mode, shift = _DIV, initial_shift(display, False, _TYPE_MAX_SHIFT, self._target.precision)
 
         # Everything the draw callback and modal need lives in a plain dict, so the draw
         # handler never holds a reference to the operator instance.
@@ -1252,7 +1267,8 @@ class VP_OT_slide(Operator):
             # The same whole-number rule as a direct slide: a field without decimals never starts
             # coarser than 0.1, even though the popup shows 0 decimals for it. An exponent chosen in
             # the popup (or a field with decimals) is kept; Z still goes coarser during the slide.
-            if mode == _DIV and not self._target.is_int and not count_decimals(display) and shift == 0:
+            if (mode == _DIV and not self._target.is_int and shift == 0
+                    and not count_decimals(round_to_display(display, self._target.precision))):
                 shift = 1
         else:
             # Same starting-step logic as typing, except for a field without decimals (0, 1, 10 ...):
@@ -1263,7 +1279,7 @@ class VP_OT_slide(Operator):
             if self._target.is_int:
                 mode, shift = _MUL, 0
             else:
-                mode, shift = _DIV, max(1, initial_shift(display, False))
+                mode, shift = _DIV, max(1, initial_shift(display, False, precision=self._target.precision))
 
         self._original_all = original_all           # every axis as it was (restored on cancel)
         self._expected_all = list(original_all)     # what we last wrote (for the re-apply timer)
